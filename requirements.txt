@@ -1,0 +1,21 @@
+# Telegram
+telethon>=1.36
+cryptg>=0.4              # Faster encryption for Telethon media
+
+# Configuration & Validation
+pydantic>=2.11
+pydantic-settings>=2.9
+python-dotenv>=1.1
+
+# AI / LLM
+mistralai>=1.6           # Mistral API (including Pixtral vision)
+
+# HTTP
+httpx>=0.28
+
+# Logging
+loguru>=0.7
+
+# Testing
+pytest>=8.0
+pytest-asyncio>=0.25
