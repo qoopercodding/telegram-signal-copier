@@ -126,6 +126,20 @@ def mark_forwarded(message_id: int, chat_id: int, forwarded_to: int) -> None:
     logger.debug(f"Wiadomość {message_id} → forwarded_to={forwarded_to}")
 
 
+def update_media_paths(message_id: int, chat_id: int, media_paths: list[str]) -> None:
+    """Aktualizuje ścieżki do pobranych mediów w SQLite."""
+    import json
+
+    media_json = json.dumps(media_paths)
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE raw_messages SET media_paths = ? WHERE message_id = ? AND chat_id = ?",
+            (media_json, message_id, chat_id),
+        )
+        conn.commit()
+    logger.debug(f"Wiadomość {message_id} → media_paths zaktualizowane ({len(media_paths)} plików)")
+
+
 def count_messages() -> int:
     """Zwraca łączną liczbę zapisanych wiadomości."""
     with get_connection() as conn:
