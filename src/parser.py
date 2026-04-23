@@ -29,14 +29,14 @@ from src.models import (
 )
 
 
-# ============================================================
-# Konfiguracja Gemini
-# ============================================================
+MODELS_TO_TRY = ["gemini-2.0-flash-lite", "gemini-1.5-flash"]
 
-def get_model() -> genai.GenerativeModel:
+
+def get_model(model_name: str = None) -> genai.GenerativeModel:
     """Zwraca skonfigurowany model Gemini."""
     genai.configure(api_key=settings.gemini_api_key)
-    return genai.GenerativeModel("gemini-2.0-flash")
+    name = model_name or MODELS_TO_TRY[0]
+    return genai.GenerativeModel(name)
 
 
 # ============================================================
@@ -92,10 +92,13 @@ async def analyze_message(
 ) -> dict:
     """
     Analizuje wiadomość tradera — tekst i/lub zdjęcia.
+    Próbuje kolejne modele jeśli rate limit.
 
     Returns:
         Dict z kluczami: message_type, confidence, summary, trade_signal
     """
+    import asyncio
+
     if not settings.gemini_api_key:
         logger.warning("GEMINI_API_KEY nie ustawiony — pomijam analizę AI")
         return {
@@ -105,10 +108,9 @@ async def analyze_message(
             "trade_signal": None,
         }
 
-    model = get_model()
+    # Buduj content_parts
     content_parts = []
 
-    # Dodaj tekst
     prompt = CLASSIFY_PROMPT
     if text:
         prompt += f"\n\nTEKST: {text}"
@@ -139,41 +141,62 @@ async def analyze_message(
                 except Exception as e:
                     logger.error(f"Błąd ładowania obrazu {path}: {e}")
 
-    # Wywołaj Gemini
-    try:
-        response = await model.generate_content_async(content_parts)
-        raw_response = response.text.strip()
+    # Próbuj modele po kolei (fallback przy rate limit)
+    for model_name in MODELS_TO_TRY:
+        for attempt in range(3):  # Max 3 próby per model
+            try:
+                model = get_model(model_name)
+                response = await model.generate_content_async(content_parts)
+                raw_response = response.text.strip()
 
-        # Wyczyść response — Gemini czasem zwraca ```json ... ```
-        if raw_response.startswith("```"):
-            raw_response = raw_response.split("\n", 1)[1]  # Usuń ```json
-            raw_response = raw_response.rsplit("```", 1)[0]  # Usuń końcowe ```
-            raw_response = raw_response.strip()
+                # Wyczyść response — Gemini czasem zwraca ```json ... ```
+                if raw_response.startswith("```"):
+                    raw_response = raw_response.split("\n", 1)[1]
+                    raw_response = raw_response.rsplit("```", 1)[0]
+                    raw_response = raw_response.strip()
 
-        result = json.loads(raw_response)
-        logger.info(
-            f"🤖 AI: {result.get('message_type', '?')} "
-            f"(confidence={result.get('confidence', 0):.2f}) "
-            f"— {result.get('summary', '?')}"
-        )
-        return result
+                result = json.loads(raw_response)
+                logger.info(
+                    f"🤖 AI ({model_name}): {result.get('message_type', '?')} "
+                    f"(confidence={result.get('confidence', 0):.2f}) "
+                    f"— {result.get('summary', '?')}"
+                )
+                return result
 
-    except json.JSONDecodeError as e:
-        logger.error(f"❌ AI zwrócił niepoprawny JSON: {e}\nRaw: {raw_response[:200]}")
-        return {
-            "message_type": "UNKNOWN",
-            "confidence": 0.0,
-            "summary": f"Błąd parsowania odpowiedzi AI",
-            "trade_signal": None,
-        }
-    except Exception as e:
-        logger.error(f"❌ Błąd Gemini API: {e}")
-        return {
-            "message_type": "UNKNOWN",
-            "confidence": 0.0,
-            "summary": f"Błąd API: {str(e)[:100]}",
-            "trade_signal": None,
-        }
+            except json.JSONDecodeError as e:
+                logger.error(f"❌ AI zwrócił niepoprawny JSON: {e}\nRaw: {raw_response[:200]}")
+                return {
+                    "message_type": "UNKNOWN",
+                    "confidence": 0.0,
+                    "summary": "Błąd parsowania odpowiedzi AI",
+                    "trade_signal": None,
+                }
+            except Exception as e:
+                error_str = str(e)
+                if "429" in error_str or "quota" in error_str.lower():
+                    wait = (attempt + 1) * 15  # 15s, 30s, 45s
+                    logger.warning(f"⏳ Rate limit ({model_name}) — czekam {wait}s (próba {attempt+1}/3)")
+                    await asyncio.sleep(wait)
+                    continue
+                else:
+                    logger.error(f"❌ Błąd Gemini API ({model_name}): {e}")
+                    return {
+                        "message_type": "UNKNOWN",
+                        "confidence": 0.0,
+                        "summary": f"Błąd API: {str(e)[:100]}",
+                        "trade_signal": None,
+                    }
+
+        logger.warning(f"🔄 Model {model_name} wyczerpany — próbuję następny")
+
+    # Wszystkie modele wyczerpane
+    logger.error("❌ Wszystkie modele Gemini zwróciły rate limit")
+    return {
+        "message_type": "UNKNOWN",
+        "confidence": 0.0,
+        "summary": "Rate limit — spróbuj za chwilę",
+        "trade_signal": None,
+    }
 
 
 # ============================================================
