@@ -1,5 +1,5 @@
 """
-AI Parser — analiza wiadomości tradera przez Google Gemini.
+AI Parser — analiza wiadomości tradera przez Google Gemini REST API.
 
 Co robi:
   1. Klasyfikuje wiadomość (PORTFOLIO_UPDATE / TRADE_ACTION / COMMENT / UNKNOWN)
@@ -12,12 +12,13 @@ Użycie:
     result = await analyze_message(text="Kupiłem 100 XTB", media_paths=[])
 """
 
+import asyncio
 import json
 import base64
 from pathlib import Path
 from typing import Optional
 
-import google.generativeai as genai
+import httpx
 from loguru import logger
 
 from src.config import settings
@@ -29,14 +30,12 @@ from src.models import (
 )
 
 
+# ============================================================
+# Konfiguracja — REST API (bez deprecated SDK)
+# ============================================================
+
+GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 MODELS_TO_TRY = ["gemini-2.0-flash-lite", "gemini-1.5-flash"]
-
-
-def get_model(model_name: str = None) -> genai.GenerativeModel:
-    """Zwraca skonfigurowany model Gemini."""
-    genai.configure(api_key=settings.gemini_api_key)
-    name = model_name or MODELS_TO_TRY[0]
-    return genai.GenerativeModel(name)
 
 
 # ============================================================
@@ -83,6 +82,45 @@ WIADOMOŚĆ DO ANALIZY:
 
 
 # ============================================================
+# REST API call
+# ============================================================
+
+async def call_gemini_rest(
+    model_name: str,
+    api_key: str,
+    parts: list[dict],
+) -> dict:
+    """Wywołuje Gemini API przez REST (httpx) zamiast deprecated gRPC SDK."""
+    url = GEMINI_API_URL.format(model=model_name)
+
+    payload = {
+        "contents": [{"parts": parts}],
+        "generationConfig": {
+            "temperature": 0.1,
+            "maxOutputTokens": 1024,
+        },
+    }
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        response = await client.post(
+            url,
+            params={"key": api_key},
+            json=payload,
+        )
+
+    if response.status_code == 429:
+        raise Exception(f"429 Rate limit exceeded")
+    elif response.status_code == 403:
+        raise Exception(f"403 API blocked: {response.text[:200]}")
+    elif response.status_code != 200:
+        raise Exception(f"{response.status_code} {response.text[:200]}")
+
+    data = response.json()
+    text = data["candidates"][0]["content"]["parts"][0]["text"]
+    return {"text": text}
+
+
+# ============================================================
 # Główna funkcja parsera
 # ============================================================
 
@@ -93,12 +131,8 @@ async def analyze_message(
     """
     Analizuje wiadomość tradera — tekst i/lub zdjęcia.
     Próbuje kolejne modele jeśli rate limit.
-
-    Returns:
-        Dict z kluczami: message_type, confidence, summary, trade_signal
+    Używa REST API (httpx) zamiast deprecated gRPC SDK.
     """
-    import asyncio
-
     if not settings.gemini_api_key:
         logger.warning("GEMINI_API_KEY nie ustawiony — pomijam analizę AI")
         return {
@@ -108,8 +142,8 @@ async def analyze_message(
             "trade_signal": None,
         }
 
-    # Buduj content_parts
-    content_parts = []
+    # Buduj parts dla REST API
+    parts = []
 
     prompt = CLASSIFY_PROMPT
     if text:
@@ -117,15 +151,15 @@ async def analyze_message(
     else:
         prompt += "\n\nTEKST: (brak tekstu — tylko media)"
 
-    content_parts.append(prompt)
+    parts.append({"text": prompt})
 
-    # Dodaj zdjęcia (vision)
+    # Dodaj zdjęcia (vision) jako base64
     if media_paths:
         for path_str in media_paths:
             path = Path(path_str)
             if path.exists() and path.suffix.lower() in (".jpg", ".jpeg", ".png", ".webp"):
                 try:
-                    image_data = path.read_bytes()
+                    image_data = base64.b64encode(path.read_bytes()).decode("utf-8")
                     mime_type = {
                         ".jpg": "image/jpeg",
                         ".jpeg": "image/jpeg",
@@ -133,9 +167,11 @@ async def analyze_message(
                         ".webp": "image/webp",
                     }.get(path.suffix.lower(), "image/jpeg")
 
-                    content_parts.append({
-                        "mime_type": mime_type,
-                        "data": image_data,
+                    parts.append({
+                        "inline_data": {
+                            "mime_type": mime_type,
+                            "data": image_data,
+                        }
                     })
                     logger.debug(f"📷 Dodano obraz do analizy: {path.name}")
                 except Exception as e:
@@ -143,11 +179,10 @@ async def analyze_message(
 
     # Próbuj modele po kolei (fallback przy rate limit)
     for model_name in MODELS_TO_TRY:
-        for attempt in range(3):  # Max 3 próby per model
+        for attempt in range(3):
             try:
-                model = get_model(model_name)
-                response = await model.generate_content_async(content_parts)
-                raw_response = response.text.strip()
+                result = await call_gemini_rest(model_name, settings.gemini_api_key, parts)
+                raw_response = result["text"].strip()
 
                 # Wyczyść response — Gemini czasem zwraca ```json ... ```
                 if raw_response.startswith("```"):
@@ -155,13 +190,13 @@ async def analyze_message(
                     raw_response = raw_response.rsplit("```", 1)[0]
                     raw_response = raw_response.strip()
 
-                result = json.loads(raw_response)
+                parsed = json.loads(raw_response)
                 logger.info(
-                    f"🤖 AI ({model_name}): {result.get('message_type', '?')} "
-                    f"(confidence={result.get('confidence', 0):.2f}) "
-                    f"— {result.get('summary', '?')}"
+                    f"🤖 AI ({model_name}): {parsed.get('message_type', '?')} "
+                    f"(confidence={parsed.get('confidence', 0):.2f}) "
+                    f"— {parsed.get('summary', '?')}"
                 )
-                return result
+                return parsed
 
             except json.JSONDecodeError as e:
                 logger.error(f"❌ AI zwrócił niepoprawny JSON: {e}\nRaw: {raw_response[:200]}")
@@ -173,8 +208,8 @@ async def analyze_message(
                 }
             except Exception as e:
                 error_str = str(e)
-                if "429" in error_str or "quota" in error_str.lower():
-                    wait = (attempt + 1) * 15  # 15s, 30s, 45s
+                if "429" in error_str:
+                    wait = (attempt + 1) * 15
                     logger.warning(f"⏳ Rate limit ({model_name}) — czekam {wait}s (próba {attempt+1}/3)")
                     await asyncio.sleep(wait)
                     continue
@@ -189,7 +224,6 @@ async def analyze_message(
 
         logger.warning(f"🔄 Model {model_name} wyczerpany — próbuję następny")
 
-    # Wszystkie modele wyczerpane
     logger.error("❌ Wszystkie modele Gemini zwróciły rate limit")
     return {
         "message_type": "UNKNOWN",
