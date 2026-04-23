@@ -367,16 +367,15 @@ async def main() -> None:
     async def _cleanup(event):
         await cmd_cleanup(event)
 
-    async with client:
-        await client.start(bot_token=settings.bot_token)
-        me = await client.get_me()
-        logger.info(f"✅ Monitor Bot zalogowany: @{me.username}")
+    await client.start(bot_token=settings.bot_token)
+    me = await client.get_me()
+    logger.info(f"✅ Monitor Bot zalogowany: @{me.username}")
 
-        # Uruchom heartbeat checker w tle
-        asyncio.create_task(heartbeat_checker())
+    # Uruchom heartbeat checker w tle
+    asyncio.create_task(heartbeat_checker())
 
-        logger.info("👂 Czekam na komendy...")
-        await client.run_until_disconnected()
+    logger.info("👂 Czekam na komendy...")
+    await client.run_until_disconnected()
 
 
 if __name__ == "__main__":
