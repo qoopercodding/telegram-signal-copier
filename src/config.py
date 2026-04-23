@@ -35,7 +35,7 @@ class Settings(BaseSettings):
     decision_chat_id: int = 0       # Twoje chat ID
 
     # --- AI ---
-    mistral_api_key: str = ""
+    gemini_api_key: str = ""
 
     # --- Portfolio ---
     my_portfolio_size: float = 100_000.0    # PLN

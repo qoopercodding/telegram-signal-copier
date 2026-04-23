@@ -41,6 +41,26 @@ CREATE_INDEXES = [
 ]
 
 
+CREATE_AI_ANALYSES = """
+CREATE TABLE IF NOT EXISTS ai_analyses (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    message_id      INTEGER NOT NULL,
+    chat_id         INTEGER NOT NULL,
+    message_type    TEXT,                        -- TRADE_ACTION / PORTFOLIO_UPDATE / COMMENT / UNKNOWN
+    confidence      REAL NOT NULL DEFAULT 0.0,
+    summary         TEXT,
+    action          TEXT,                        -- BUY / SELL / CLOSE / REDUCE / ADD
+    ticker          TEXT,
+    quantity         REAL,
+    price           REAL,
+    reason          TEXT,
+    raw_response    TEXT,                        -- Pełna odpowiedź AI jako JSON
+    created_at      TEXT NOT NULL,
+    UNIQUE(message_id, chat_id)
+);
+"""
+
+
 def get_connection() -> sqlite3.Connection:
     """Zwraca połączenie z bazą SQLite. Tworzy plik jeśli nie istnieje."""
     db_path = Path(settings.db_path)
@@ -55,6 +75,7 @@ def init_db() -> None:
     """Tworzy tabele i indeksy jeśli nie istnieją."""
     with get_connection() as conn:
         conn.execute(CREATE_RAW_MESSAGES)
+        conn.execute(CREATE_AI_ANALYSES)
         for idx_sql in CREATE_INDEXES:
             conn.execute(idx_sql)
         conn.commit()
@@ -138,6 +159,43 @@ def update_media_paths(message_id: int, chat_id: int, media_paths: list[str]) ->
         )
         conn.commit()
     logger.debug(f"Wiadomość {message_id} → media_paths zaktualizowane ({len(media_paths)} plików)")
+
+
+def save_ai_analysis(message_id: int, chat_id: int, ai_result: dict) -> None:
+    """Zapisuje wynik analizy AI do SQLite."""
+    import json
+
+    trade = ai_result.get("trade_signal") or {}
+    now = datetime.utcnow().isoformat()
+
+    try:
+        with get_connection() as conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO ai_analyses
+                    (message_id, chat_id, message_type, confidence, summary,
+                     action, ticker, quantity, price, reason, raw_response, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    message_id,
+                    chat_id,
+                    ai_result.get("message_type", "UNKNOWN"),
+                    ai_result.get("confidence", 0.0),
+                    ai_result.get("summary"),
+                    trade.get("action"),
+                    trade.get("ticker"),
+                    trade.get("quantity"),
+                    trade.get("price"),
+                    trade.get("reason"),
+                    json.dumps(ai_result, ensure_ascii=False),
+                    now,
+                ),
+            )
+            conn.commit()
+        logger.debug(f"AI analiza zapisana dla msg {message_id}")
+    except Exception as e:
+        logger.error(f"Błąd zapisu AI analizy: {e}")
 
 
 def count_messages() -> int:

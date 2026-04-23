@@ -1,5 +1,5 @@
 """
-Telethon Listener — Iteracja 2: Read, Download Media & Forward.
+Telethon Listener — Iteracja 3: Read, Download, Forward & AI Parse.
 
 Co robi:
   1. Loguje się do Telegrama jako Ty (userbot)
@@ -7,6 +7,7 @@ Co robi:
   3. Pobiera media (zdjęcia, dokumenty) i zapisuje lokalnie
   4. Zapisuje każdą wiadomość do SQLite (z ścieżkami do mediów)
   5. Forwarduje wiadomość do RAW_CHANNEL_ID
+  6. Analizuje wiadomość przez Google Gemini (AI parser)
 
 Uruchomienie:
     python -m src.listener
@@ -27,7 +28,8 @@ from telethon.tl.types import (
 )
 
 from src.config import settings, ensure_directories, LOGS_DIR, MEDIA_DIR
-from src.storage import init_db, save_raw_message, mark_forwarded, update_media_paths, count_messages
+from src.storage import init_db, save_raw_message, mark_forwarded, update_media_paths, save_ai_analysis, count_messages
+from src.parser import analyze_message
 
 
 # ============================================================
@@ -177,6 +179,22 @@ async def handle_new_message(event: events.NewMessage.Event, client: TelegramCli
 
     except Exception as e:
         logger.error(f"❌ Błąd forwardu wiadomości {msg.id}: {e}")
+
+    # --- 5. Analiza AI (jeśli klucz ustawiony) ---
+    if settings.gemini_api_key:
+        try:
+            ai_result = await analyze_message(
+                text=msg.text or None,
+                media_paths=media_paths if media_paths else None,
+            )
+            save_ai_analysis(msg.id, event.chat_id, ai_result)
+            logger.info(
+                f"🤖 AI: {ai_result.get('message_type', '?')} | "
+                f"confidence={ai_result.get('confidence', 0):.2f} | "
+                f"{ai_result.get('summary', '?')}"
+            )
+        except Exception as e:
+            logger.error(f"❌ Błąd AI analizy: {e}")
 
 
 # ============================================================
