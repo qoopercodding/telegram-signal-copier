@@ -180,10 +180,59 @@ async def handle_new_message(event: events.NewMessage.Event, client: TelegramCli
 
 
 # ============================================================
+# Heartbeat (monitor bot sprawdza ten plik)
+# ============================================================
+
+HEARTBEAT_FILE = LOGS_DIR.parent / ".heartbeat"
+
+_last_message_at: str = "brak"
+_start_time = None
+
+
+def write_heartbeat() -> None:
+    """Zapisuje heartbeat do pliku JSON."""
+    import json
+    from datetime import timedelta
+    import time
+
+    global _start_time
+    if _start_time is None:
+        _start_time = time.time()
+
+    uptime_delta = timedelta(seconds=int(time.time() - _start_time))
+    days = uptime_delta.days
+    hours, remainder = divmod(uptime_delta.seconds, 3600)
+    minutes, _ = divmod(remainder, 60)
+
+    data = {
+        "timestamp": datetime.utcnow().isoformat(),
+        "uptime": f"{days}d {hours}h {minutes}m",
+        "last_message_at": _last_message_at,
+        "messages_total": count_messages(),
+    }
+    HEARTBEAT_FILE.write_text(json.dumps(data))
+
+
+async def heartbeat_loop() -> None:
+    """Co 5 minut zapisuje heartbeat."""
+    while True:
+        try:
+            write_heartbeat()
+            logger.debug("💓 Heartbeat zapisany")
+        except Exception as e:
+            logger.error(f"Heartbeat error: {e}")
+        await asyncio.sleep(300)  # 5 minut
+
+
+# ============================================================
 # Główna pętla
 # ============================================================
 
 async def main() -> None:
+    global _last_message_at, _start_time
+    import time
+    _start_time = time.time()
+
     ensure_directories()
     setup_logging()
     init_db()
@@ -202,12 +251,21 @@ async def main() -> None:
 
     @client.on(source_filter)
     async def _handler(event: events.NewMessage.Event) -> None:
+        global _last_message_at
+        _last_message_at = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
         await handle_new_message(event, client)
 
     async with client:
         me = await client.get_me()
         logger.info(f"✅ Zalogowano jako: {me.first_name} (@{me.username})")
         logger.info("👂 Nasłuchuję... (Ctrl+C żeby zatrzymać)")
+
+        # Pierwszy heartbeat
+        write_heartbeat()
+
+        # Uruchom heartbeat w tle
+        asyncio.create_task(heartbeat_loop())
+
         await client.run_until_disconnected()
 
 
