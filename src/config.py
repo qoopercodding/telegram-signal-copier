@@ -46,6 +46,7 @@ class Settings(BaseSettings):
     damian_ike_topic_id: int = 8951
     damian_ikze_topic_id: int = 8953
     damian_session_name: str = "damian_watcher"
+    userbot_phone: str = ""          # numer tel. do logowania Telethon
 
     # --- Ustawienia techniczne ---
     session_name: str = "signal_copier"     # nazwa pliku .session
