@@ -46,14 +46,27 @@ def _get_target_chat() -> int | None:
 
 def _build_message(ai_result: dict) -> str:
     """Buduje sformatowany tekst wiadomości Telegram (Markdown)."""
+    msg_type   = ai_result.get("message_type")
+    confidence = ai_result.get("confidence", 0.0)
+    summary    = ai_result.get("summary", "brak opisu")
+
+    if msg_type == "PORTFOLIO_UPDATE":
+        lines = [
+            "📊 *AKTUALIZACJA PORTFELA*",
+            "",
+            f"📝 {summary}",
+            "",
+            f"🎯 Pewność AI: *{confidence * 100:.0f}%*"
+        ]
+        return "\n".join(lines)
+
+    # --- Reszta to TRADE_ACTION ---
     ts         = ai_result.get("trade_signal") or {}
     action     = ts.get("action", "UNKNOWN")
     ticker     = ts.get("ticker")
     qty        = ts.get("quantity")
     price      = ts.get("price")
     reason     = ts.get("reason", "")
-    confidence = ai_result.get("confidence", 0.0)
-    summary    = ai_result.get("summary", "brak opisu")
 
     emoji, action_pl = ACTION_LABELS.get(action, ("⚪", action))
     ticker_disp = f"`{ticker}`" if ticker else "nieznany"
@@ -97,16 +110,9 @@ def _build_message(ai_result: dict) -> str:
 # Główna funkcja
 # ============================================================
 
-async def send_signal_notification(msg_id: int, ai_result: dict) -> bool:
+async def send_signal_notification(msg_id: int, ai_result: dict, media_paths: list[str] = None) -> bool:
     """
-    Wysyła powiadomienie o sygnale tradingowym z przyciskami ✅/❌.
-
-    Args:
-        msg_id:     ID wiadomości z Telegramu (klucz w SQLite).
-        ai_result:  Wynik z analyze_message() — słownik z polami message_type, trade_signal, itp.
-
-    Returns:
-        True jeśli wiadomość wysłana pomyślnie, False w przeciwnym razie.
+    Wysyła powiadomienie o sygnale tradingowym lub portfelu z ew. zdjęciem.
     """
     if not settings.bot_token:
         logger.warning("BOT_TOKEN nie ustawiony — pomijam powiadomienie decyzyjne")
@@ -117,48 +123,69 @@ async def send_signal_notification(msg_id: int, ai_result: dict) -> bool:
         logger.warning("Brak DECISION_CHAT_ID i pliku .admin_chat_id — pomijam powiadomienie")
         return False
 
-    ts     = ai_result.get("trade_signal") or {}
-    ticker = ts.get("ticker", "?")
-    action = ts.get("action", "?")
-
+    msg_type = ai_result.get("message_type")
     text     = _build_message(ai_result)
-    keyboard = {
-        "inline_keyboard": [[
-            {
-                "text":          "✅ AKCEPTUJ",
-                "callback_data": f"accept:{msg_id}:{ticker}:{action}",
-            },
-            {
-                "text":          "❌ ODRZUĆ",
-                "callback_data": f"reject:{msg_id}",
-            },
-        ]]
-    }
+    
+    # Dodaj klawiaturę decyzyjną tylko do TRADE_ACTION
+    keyboard = {}
+    if msg_type == "TRADE_ACTION":
+        ts     = ai_result.get("trade_signal") or {}
+        ticker = ts.get("ticker", "?")
+        action = ts.get("action", "?")
+        keyboard = {
+            "inline_keyboard": [[
+                {
+                    "text":          "✅ AKCEPTUJ",
+                    "callback_data": f"accept:{msg_id}:{ticker}:{action}",
+                },
+                {
+                    "text":          "❌ ODRZUĆ",
+                    "callback_data": f"reject:{msg_id}",
+                },
+            ]]
+        }
 
-    url = TELEGRAM_API.format(token=settings.bot_token, method="sendMessage")
-
+    # Wybierz odpowiednią metodę API w zależności od załączników
+    has_photo = media_paths and any(p.lower().endswith(('.jpg', '.jpeg', '.png', '.webp')) for p in media_paths)
+    
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.post(
-                url,
-                json={
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            if has_photo:
+                # Wysyłamy zdjęcie
+                photo_path = next(p for p in media_paths if p.lower().endswith(('.jpg', '.jpeg', '.png', '.webp')))
+                url = TELEGRAM_API.format(token=settings.bot_token, method="sendPhoto")
+                
+                with open(photo_path, "rb") as f:
+                    # Telegram API przyjmuje 'caption' do 1024 znaków. Jeśli tekst jest za długi, obcinamy.
+                    caption = text if len(text) <= 1024 else text[:1020] + "..."
+                    data = {
+                        "chat_id": chat_id,
+                        "caption": caption,
+                        "parse_mode": "Markdown",
+                    }
+                    if keyboard:
+                        import json
+                        data["reply_markup"] = json.dumps(keyboard)
+
+                    files = {"photo": f}
+                    resp = await client.post(url, data=data, files=files)
+            else:
+                # Wysyłamy zwykły tekst
+                url = TELEGRAM_API.format(token=settings.bot_token, method="sendMessage")
+                payload = {
                     "chat_id":      chat_id,
                     "text":         text,
                     "parse_mode":   "Markdown",
-                    "reply_markup": keyboard,
-                },
-            )
+                }
+                if keyboard:
+                    payload["reply_markup"] = keyboard
+                resp = await client.post(url, json=payload)
 
         if resp.status_code == 200:
-            logger.info(
-                f"📨 Powiadomienie wysłane → chat={chat_id} "
-                f"msg_id={msg_id} ({action} {ticker})"
-            )
+            logger.info(f"📨 Powiadomienie wysłane → chat={chat_id} msg_id={msg_id}")
             return True
         else:
-            logger.error(
-                f"❌ Bot API {resp.status_code}: {resp.text[:200]}"
-            )
+            logger.error(f"❌ Bot API {resp.status_code}: {resp.text[:200]}")
             return False
 
     except Exception as exc:

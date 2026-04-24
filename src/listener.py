@@ -161,25 +161,22 @@ async def handle_new_message(event: events.NewMessage.Event, client: TelegramCli
         update_media_paths(msg.id, event.chat_id, media_paths)
         logger.success(f"💾 Zapisano {len(media_paths)} plik(ów) dla msg {msg.id}")
 
-    # --- 4. Forwarduj do kanału docelowego ---
+    # --- 4. Forwarduj do kanału docelowego (Tylko jeśli chcemy surowy backup) ---
     target_id = settings.raw_channel_id
-    if target_id == 0:
-        logger.warning("RAW_CHANNEL_ID nie ustawione — pomijam forward (tylko zapis do SQLite)")
-        return
-
-    try:
-        forwarded = await client.forward_messages(
-            entity=target_id,
-            messages=msg.id,
-            from_peer=event.chat_id,
-        )
-        # Telethon zwraca listę lub pojedynczy obiekt
-        fwd_id = forwarded[0].id if isinstance(forwarded, list) else forwarded.id
-        mark_forwarded(msg.id, event.chat_id, fwd_id)
-        logger.success(f"✅ Forward {msg.id} → {target_id} (nowe ID: {fwd_id})")
-
-    except Exception as e:
-        logger.error(f"❌ Błąd forwardu wiadomości {msg.id}: {e}")
+    if target_id != 0:
+        try:
+            forwarded = await client.forward_messages(
+                entity=target_id,
+                messages=msg.id,
+                from_peer=event.chat_id,
+            )
+            fwd_id = forwarded[0].id if isinstance(forwarded, list) else forwarded.id
+            mark_forwarded(msg.id, event.chat_id, fwd_id)
+            logger.success(f"✅ Backup forward {msg.id} → {target_id} (nowe ID: {fwd_id})")
+        except Exception as e:
+            logger.error(f"❌ Błąd backup forwardu wiadomości {msg.id}: {e}")
+    else:
+        logger.debug("RAW_CHANNEL_ID nie ustawione — pomijam surowy backup")
 
     # --- 5. Analiza AI (jeśli klucz ustawiony) ---
     if settings.gemini_api_key:
@@ -195,11 +192,11 @@ async def handle_new_message(event: events.NewMessage.Event, client: TelegramCli
                 f"{ai_result.get('summary', '?')}"
             )
 
-            # --- 6. Wyślij powiadomienie decyzyjne (jeśli sygnał handlowy) ---
+            # --- 6. Wyślij powiadomienie docelowe (sygnał lub portfel) ---
             msg_type   = ai_result.get("message_type")
             confidence = ai_result.get("confidence", 0.0)
-            if msg_type == "TRADE_ACTION" and confidence >= 0.6:
-                await send_signal_notification(msg.id, ai_result)
+            if msg_type in ("TRADE_ACTION", "PORTFOLIO_UPDATE") and confidence >= 0.6:
+                await send_signal_notification(msg.id, ai_result, media_paths)
             else:
                 logger.debug(
                     f"ℹ️ Bez powiadomienia: type={msg_type}, "
