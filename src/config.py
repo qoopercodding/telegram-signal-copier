@@ -41,6 +41,12 @@ class Settings(BaseSettings):
     my_portfolio_size: float = 100_000.0    # PLN
     signal_ttl_minutes: int = 15            # auto-EXPIRED po tym czasie
 
+    # --- Prywatna grupa Damiana (forum topics) ---
+    damian_group_id: int = 0
+    damian_ike_topic_id: int = 8951
+    damian_ikze_topic_id: int = 8953
+    damian_session_name: str = "damian_watcher"
+
     # --- Ustawienia techniczne ---
     session_name: str = "signal_copier"     # nazwa pliku .session
     db_path: str = str(DB_DIR / "signals.db")
