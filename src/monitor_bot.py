@@ -296,6 +296,51 @@ async def cmd_cleanup(event: events.NewMessage.Event) -> None:
 
 
 # ============================================================
+# Handler przycisków AKCEPTUJ / ODRÓĆ (Decision Bot)
+# ============================================================
+
+async def cmd_callback(event: events.CallbackQuery.Event) -> None:
+    """
+    Obsługuje kliknięcia przycisków inline:
+      accept:{msg_id}:{ticker}:{action}
+      reject:{msg_id}
+    """
+    data = event.data.decode("utf-8")
+    now  = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+
+    if data.startswith("accept:"):
+        parts  = data.split(":")
+        msg_id = parts[1] if len(parts) > 1 else "?"
+        ticker = parts[2] if len(parts) > 2 else "?"
+        action = parts[3] if len(parts) > 3 else "?"
+
+        logger.info(f"✅ Admin zaakceptował sygnał msg_id={msg_id}: {action} {ticker}")
+        await event.edit(
+            f"✅ *ZAAKCEPTOWANO*\n\n"
+            f"Sygnał `{action} {ticker}` (msg #{msg_id}) zatwierdzony.\n"
+            f"_⏰ {now}_"
+        )
+
+    elif data.startswith("reject:"):
+        parts  = data.split(":")
+        msg_id = parts[1] if len(parts) > 1 else "?"
+
+        logger.info(f"❌ Admin odrzucił sygnał msg_id={msg_id}")
+        await event.edit(
+            f"❌ *ODRÓCONO*\n\n"
+            f"Sygnał (msg #{msg_id}) odrzucony.\n"
+            f"_⏰ {now}_"
+        )
+
+    else:
+        logger.warning(f"Nieznany callback: {data}")
+        await event.answer("Nieznana akcja")
+        return
+
+    await event.answer()  # Ukryj "zegarek" w Telegramie
+
+
+# ============================================================
 # Heartbeat checker (działa w tle)
 # ============================================================
 
@@ -366,6 +411,10 @@ async def main() -> None:
     @client.on(events.NewMessage(pattern="/cleanup"))
     async def _cleanup(event):
         await cmd_cleanup(event)
+
+    @client.on(events.CallbackQuery())
+    async def _callback(event):
+        await cmd_callback(event)
 
     await client.start(bot_token=settings.bot_token)
     me = await client.get_me()

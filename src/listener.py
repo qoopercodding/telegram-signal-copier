@@ -30,6 +30,7 @@ from telethon.tl.types import (
 from src.config import settings, ensure_directories, LOGS_DIR, MEDIA_DIR
 from src.storage import init_db, save_raw_message, mark_forwarded, update_media_paths, save_ai_analysis, count_messages
 from src.parser import analyze_message
+from src.notifier import send_signal_notification
 
 
 # ============================================================
@@ -193,6 +194,18 @@ async def handle_new_message(event: events.NewMessage.Event, client: TelegramCli
                 f"confidence={ai_result.get('confidence', 0):.2f} | "
                 f"{ai_result.get('summary', '?')}"
             )
+
+            # --- 6. Wyślij powiadomienie decyzyjne (jeśli sygnał handlowy) ---
+            msg_type   = ai_result.get("message_type")
+            confidence = ai_result.get("confidence", 0.0)
+            if msg_type == "TRADE_ACTION" and confidence >= 0.6:
+                await send_signal_notification(msg.id, ai_result)
+            else:
+                logger.debug(
+                    f"ℹ️ Bez powiadomienia: type={msg_type}, "
+                    f"confidence={confidence:.2f} (próg 0.6)"
+                )
+
         except Exception as e:
             logger.error(f"❌ Błąd AI analizy: {e}")
 
