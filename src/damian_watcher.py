@@ -122,30 +122,74 @@ async def _poll_for_reply(offset: int, pattern: str, timeout: int = 120) -> str:
     raise TimeoutError(f"Brak odpowiedzi w ciągu {timeout}s")
 
 
-async def _ask_for_sms_code() -> str:
-    """Wysyła prośbę o kod SMS na kanał i czeka na odpowiedź (2 min)."""
-    offset = await _get_current_offset()
-    await _bot_send(
-        "🔑 *damian\\_watcher* loguje się do Telegrama.\n\n"
-        "Wpisz tutaj *5-cyfrowy kod SMS* który właśnie dostałeś:"
+async def login_via_channel(client: TelegramClient) -> None:
+    """
+    Loguje Telethon userbota przez kanał Telegram.
+    Jeśli sesja już istnieje — nic nie robi.
+    """
+    from telethon.errors import (
+        SessionPasswordNeededError,
+        PhoneCodeInvalidError,
+        PhoneCodeExpiredError,
     )
-    logger.info("⏳ Czekam na kod SMS na kanale recive-bot-investor...")
-    code = await _poll_for_reply(offset, pattern=r"^\d{5,6}$", timeout=120)
-    logger.info(f"✅ Otrzymano kod SMS")
-    return code
 
+    await client.connect()
 
-async def _ask_for_2fa_password() -> str:
-    """Wysyła prośbę o hasło 2FA na kanał i czeka na odpowiedź."""
-    offset = await _get_current_offset()
-    await _bot_send(
-        "🔐 Konto ma włączone 2FA.\n\n"
-        "Wpisz tutaj *hasło 2FA* do konta Telegram:"
-    )
-    logger.info("⏳ Czekam na hasło 2FA na kanale recive-bot-investor...")
-    password = await _poll_for_reply(offset, pattern=r".{3,}", timeout=120)
-    logger.info("✅ Otrzymano hasło 2FA")
-    return password
+    if await client.is_user_authorized():
+        logger.info("✅ Sesja aktywna — logowanie pominięte")
+        return
+
+    logger.info("🔐 Brak sesji — rozpoczynam logowanie przez kanał...")
+    await _bot_send("📱 Wysyłam kod SMS na numer `+48737132141`\\.\\.\\.")
+
+    sent = await client.send_code_request(settings.userbot_phone)
+
+    for attempt in range(1, 4):
+        offset = await _get_current_offset()
+        note = "" if attempt == 1 else f" _(próba {attempt}/3 — poprzedni był nieprawidłowy)_"
+        await _bot_send(
+            f"🔑 Wpisz tutaj *5-cyfrowy kod SMS* z Telegrama{note}:"
+        )
+        logger.info(f"⏳ Czekam na kod SMS (próba {attempt}/3)...")
+
+        try:
+            code = await _poll_for_reply(offset, pattern=r"^\d{5,6}$", timeout=120)
+        except TimeoutError:
+            await _bot_send("⏰ Minął czas oczekiwania na kod. Uruchom ponownie.")
+            raise
+
+        try:
+            await client.sign_in(
+                phone=settings.userbot_phone,
+                code=code,
+                phone_code_hash=sent.phone_code_hash,
+            )
+            logger.info("✅ Zalogowano przez kod SMS")
+            return
+
+        except PhoneCodeInvalidError:
+            logger.warning(f"❌ Nieprawidłowy kod (próba {attempt}/3)")
+            if attempt == 3:
+                await _bot_send("❌ 3 nieprawidłowe kody — zatrzymuję. Uruchom ponownie.")
+                raise
+
+        except PhoneCodeExpiredError:
+            logger.warning("⏰ Kod wygasł — wysyłam nowy")
+            await _bot_send("⏰ Kod wygasł. Wysyłam nowy SMS\\.\\.\\.")
+            sent = await client.send_code_request(settings.userbot_phone)
+
+        except SessionPasswordNeededError:
+            logger.info("🔐 Wykryto 2FA — proszę o hasło")
+            offset = await _get_current_offset()
+            await _bot_send("🔐 Konto ma *2FA*\\. Wpisz tutaj hasło do Telegrama:")
+            try:
+                password = await _poll_for_reply(offset, pattern=r".{3,}", timeout=120)
+            except TimeoutError:
+                await _bot_send("⏰ Minął czas oczekiwania na hasło. Uruchom ponownie.")
+                raise
+            await client.sign_in(password=password)
+            logger.info("✅ Zalogowano przez 2FA")
+            return
 
 
 # ── Helpers ─────────────────────────────────────────────────────────────────
@@ -316,12 +360,8 @@ async def main() -> None:
         async def _on_command(event):
             await handle_user_command(event, client)
 
-    # Logowanie — kod SMS przychodzi przez kanał Telegram
-    await client.start(
-        phone=settings.userbot_phone,
-        code_callback=_ask_for_sms_code,
-        password=_ask_for_2fa_password,
-    )
+    # Logowanie — kod SMS przychodzi przez kanał recive-bot-investor
+    await login_via_channel(client)
 
     me = await client.get_me()
     logger.info(f"🚀 Damian Watcher uruchomiony jako: {me.first_name} (@{me.username})")
