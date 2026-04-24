@@ -1,5 +1,5 @@
 """
-AI Parser — analiza wiadomości tradera przez Google Gemini REST API.
+AI Parser — analiza wiadomości tradera przez Google Gemini.
 
 Co robi:
   1. Klasyfikuje wiadomość (PORTFOLIO_UPDATE / TRADE_ACTION / COMMENT / UNKNOWN)
@@ -12,13 +12,11 @@ Użycie:
     result = await analyze_message(text="Kupiłem 100 XTB", media_paths=[])
 """
 
-import asyncio
 import json
-import base64
 from pathlib import Path
 from typing import Optional
 
-import httpx
+import google.generativeai as genai
 from loguru import logger
 
 from src.config import settings
@@ -30,17 +28,67 @@ from src.models import (
 )
 
 
-# ============================================================
-# Konfiguracja — REST API (bez deprecated SDK)
-# ============================================================
+MODELS_TO_TRY = ["gemini-2.5-flash", "gemini-2.0-flash-001"]
 
-GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
-MODELS_TO_TRY = ["gemini-2.0-flash-lite", "gemini-1.5-flash"]
+# Znane tickery GPW — szybka biała lista (bez opóźnienia sieciowego)
+_GPW_KNOWN = {
+    "XTB", "PKN", "KGHM", "CDR", "PKO", "PZU", "ALE", "DNP", "CCC", "LPP",
+    "JSW", "PGE", "PGN", "OPL", "MBK", "SPL", "KGH", "PEO", "TPE", "ING",
+    "BHW", "EUR", "PCO", "TEN", "KER", "VRG", "WPL", "ATT", "GPW", "CPS",
+}
+
+
+def _check_ticker_exists(ticker: str) -> bool:
+    """Sprawdza czy ticker istnieje na GPW (.WA) lub globalnie przez yfinance."""
+    if ticker.upper() in _GPW_KNOWN:
+        return True
+    try:
+        import yfinance as yf
+        # Najpierw GPW
+        hist = yf.Ticker(f"{ticker}.WA").history(period="5d")
+        if not hist.empty:
+            return True
+        # Potem globalnie
+        hist = yf.Ticker(ticker).history(period="5d")
+        return not hist.empty
+    except Exception:
+        return True  # Przy błędzie nie karz
+
+
+async def _validate_ticker(ticker: str) -> bool:
+    """Async wrapper dla _check_ticker_exists z timeoutem 10s."""
+    import asyncio
+    try:
+        return await asyncio.wait_for(
+            asyncio.to_thread(_check_ticker_exists, ticker),
+            timeout=10.0,
+        )
+    except asyncio.TimeoutError:
+        logger.warning(f"Timeout walidacji tickera {ticker} — pomijam")
+        return True
+
+
+def get_model(model_name: str = None) -> genai.GenerativeModel:
+    """Zwraca skonfigurowany model Gemini."""
+    genai.configure(api_key=settings.gemini_api_key)
+    name = model_name or MODELS_TO_TRY[0]
+    return genai.GenerativeModel(name)
 
 
 # ============================================================
 # Prompty
 # ============================================================
+
+def _build_classify_prompt() -> str:
+    """Buduje prompt z aktualnym rozmiarem portfela użytkownika."""
+    portfolio_pln = settings.my_portfolio_size
+    portfolio_note = (
+        f"Portfel użytkownika do skalowania: {portfolio_pln:,.0f} PLN. "
+        f"Dla PORTFOLIO_UPDATE — w polu 'summary' wylicz proporcjonalne kwoty dla każdej pozycji "
+        f"(format: 'TICKER X% → Y PLN z Twojego portfela').\n\n"
+    )
+    return portfolio_note + CLASSIFY_PROMPT
+
 
 CLASSIFY_PROMPT = """Jesteś asystentem analizującym wiadomości z kanału tradera na polskiej giełdzie (GPW).
 
@@ -66,7 +114,10 @@ ODPOWIEDZ W FORMACIE JSON (TYLKO JSON, bez markdown):
         "quantity": liczba lub null,
         "price": liczba lub null,
         "reason": "dlaczego tak interpretujesz"
-    }
+    },
+    "portfolio_positions": [
+        {"ticker": "XTB", "percentage": 86.64, "value_pln": 1335500}
+    ]
 }
 
 WAŻNE ZASADY:
@@ -76,48 +127,10 @@ WAŻNE ZASADY:
 - Trader może pisać po polsku: "kupiłem", "dokupiłem", "sprzedałem", "zamknąłem"
 - "Dobieram" = ADD, "Redukcja" = REDUCE, "Zamykam pozycję" = CLOSE
 - Jeśli jest screenshot — opisz co widzisz (portfel, transakcje, chart)
+- Dla PORTFOLIO_UPDATE: w portfolio_positions wypisz WSZYSTKIE pozycje z tickerem i % udziału (oraz value_pln jeśli widoczna). Dla innych typów wiadomości: portfolio_positions = []
 
 WIADOMOŚĆ DO ANALIZY:
 """
-
-
-# ============================================================
-# REST API call
-# ============================================================
-
-async def call_gemini_rest(
-    model_name: str,
-    api_key: str,
-    parts: list[dict],
-) -> dict:
-    """Wywołuje Gemini API przez REST (httpx) zamiast deprecated gRPC SDK."""
-    url = GEMINI_API_URL.format(model=model_name)
-
-    payload = {
-        "contents": [{"parts": parts}],
-        "generationConfig": {
-            "temperature": 0.1,
-            "maxOutputTokens": 1024,
-        },
-    }
-
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        response = await client.post(
-            url,
-            params={"key": api_key},
-            json=payload,
-        )
-
-    if response.status_code == 429:
-        raise Exception(f"429 Rate limit exceeded")
-    elif response.status_code == 403:
-        raise Exception(f"403 API blocked: {response.text[:200]}")
-    elif response.status_code != 200:
-        raise Exception(f"{response.status_code} {response.text[:200]}")
-
-    data = response.json()
-    text = data["candidates"][0]["content"]["parts"][0]["text"]
-    return {"text": text}
 
 
 # ============================================================
@@ -131,8 +144,12 @@ async def analyze_message(
     """
     Analizuje wiadomość tradera — tekst i/lub zdjęcia.
     Próbuje kolejne modele jeśli rate limit.
-    Używa REST API (httpx) zamiast deprecated gRPC SDK.
+
+    Returns:
+        Dict z kluczami: message_type, confidence, summary, trade_signal
     """
+    import asyncio
+
     if not settings.gemini_api_key:
         logger.warning("GEMINI_API_KEY nie ustawiony — pomijam analizę AI")
         return {
@@ -142,24 +159,24 @@ async def analyze_message(
             "trade_signal": None,
         }
 
-    # Buduj parts dla REST API
-    parts = []
+    # Buduj content_parts
+    content_parts = []
 
-    prompt = CLASSIFY_PROMPT
+    prompt = _build_classify_prompt()
     if text:
         prompt += f"\n\nTEKST: {text}"
     else:
         prompt += "\n\nTEKST: (brak tekstu — tylko media)"
 
-    parts.append({"text": prompt})
+    content_parts.append(prompt)
 
-    # Dodaj zdjęcia (vision) jako base64
+    # Dodaj zdjęcia (vision)
     if media_paths:
         for path_str in media_paths:
             path = Path(path_str)
             if path.exists() and path.suffix.lower() in (".jpg", ".jpeg", ".png", ".webp"):
                 try:
-                    image_data = base64.b64encode(path.read_bytes()).decode("utf-8")
+                    image_data = path.read_bytes()
                     mime_type = {
                         ".jpg": "image/jpeg",
                         ".jpeg": "image/jpeg",
@@ -167,11 +184,9 @@ async def analyze_message(
                         ".webp": "image/webp",
                     }.get(path.suffix.lower(), "image/jpeg")
 
-                    parts.append({
-                        "inline_data": {
-                            "mime_type": mime_type,
-                            "data": image_data,
-                        }
+                    content_parts.append({
+                        "mime_type": mime_type,
+                        "data": image_data,
                     })
                     logger.debug(f"📷 Dodano obraz do analizy: {path.name}")
                 except Exception as e:
@@ -179,10 +194,16 @@ async def analyze_message(
 
     # Próbuj modele po kolei (fallback przy rate limit)
     for model_name in MODELS_TO_TRY:
-        for attempt in range(3):
+        for attempt in range(3):  # Max 3 próby per model
             try:
-                result = await call_gemini_rest(model_name, settings.gemini_api_key, parts)
-                raw_response = result["text"].strip()
+                model = get_model(model_name)
+                response = await model.generate_content_async(content_parts)
+                # Handle empty parts (e.g. safety filters or incomplete responses)
+                candidate = response.candidates[0] if response.candidates else None
+                if not candidate or not candidate.content or not candidate.content.parts:
+                    logger.warning(f"⚠️ Pusta odpowiedź od {model_name} — pomijam")
+                    continue
+                raw_response = "".join(p.text for p in candidate.content.parts if hasattr(p, "text")).strip()
 
                 # Wyczyść response — Gemini czasem zwraca ```json ... ```
                 if raw_response.startswith("```"):
@@ -190,13 +211,25 @@ async def analyze_message(
                     raw_response = raw_response.rsplit("```", 1)[0]
                     raw_response = raw_response.strip()
 
-                parsed = json.loads(raw_response)
+                result = json.loads(raw_response)
+
+                # Walidacja tickera — kara za zmyślone spółki
+                if result.get("message_type") == "TRADE_ACTION":
+                    ts = result.get("trade_signal") or {}
+                    ticker = ts.get("ticker")
+                    if ticker:
+                        valid = await _validate_ticker(ticker)
+                        if not valid:
+                            logger.warning(f"⚠️ Ticker {ticker} nie znaleziony — obniżam confidence do 0.1")
+                            result["confidence"] = 0.1
+                            result["summary"] = f"[NIEZNANY TICKER: {ticker}] " + result.get("summary", "")
+
                 logger.info(
-                    f"🤖 AI ({model_name}): {parsed.get('message_type', '?')} "
-                    f"(confidence={parsed.get('confidence', 0):.2f}) "
-                    f"— {parsed.get('summary', '?')}"
+                    f"🤖 AI ({model_name}): {result.get('message_type', '?')} "
+                    f"(confidence={result.get('confidence', 0):.2f}) "
+                    f"— {result.get('summary', '?')}"
                 )
-                return parsed
+                return result
 
             except json.JSONDecodeError as e:
                 logger.error(f"❌ AI zwrócił niepoprawny JSON: {e}\nRaw: {raw_response[:200]}")
@@ -208,8 +241,8 @@ async def analyze_message(
                 }
             except Exception as e:
                 error_str = str(e)
-                if "429" in error_str:
-                    wait = (attempt + 1) * 15
+                if "429" in error_str or "quota" in error_str.lower():
+                    wait = (attempt + 1) * 15  # 15s, 30s, 45s
                     logger.warning(f"⏳ Rate limit ({model_name}) — czekam {wait}s (próba {attempt+1}/3)")
                     await asyncio.sleep(wait)
                     continue
@@ -224,6 +257,7 @@ async def analyze_message(
 
         logger.warning(f"🔄 Model {model_name} wyczerpany — próbuję następny")
 
+    # Wszystkie modele wyczerpane
     logger.error("❌ Wszystkie modele Gemini zwróciły rate limit")
     return {
         "message_type": "UNKNOWN",

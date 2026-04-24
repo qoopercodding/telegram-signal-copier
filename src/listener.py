@@ -28,7 +28,7 @@ from telethon.tl.types import (
 )
 
 from src.config import settings, ensure_directories, LOGS_DIR, MEDIA_DIR
-from src.storage import init_db, save_raw_message, mark_forwarded, update_media_paths, save_ai_analysis, count_messages
+from src.storage import init_db, save_raw_message, update_media_paths, save_ai_analysis, count_messages, save_trader_positions
 from src.parser import analyze_message
 from src.notifier import send_signal_notification
 
@@ -161,24 +161,7 @@ async def handle_new_message(event: events.NewMessage.Event, client: TelegramCli
         update_media_paths(msg.id, event.chat_id, media_paths)
         logger.success(f"💾 Zapisano {len(media_paths)} plik(ów) dla msg {msg.id}")
 
-    # --- 4. Forwarduj do kanału docelowego (Tylko jeśli chcemy surowy backup) ---
-    target_id = settings.raw_channel_id
-    if target_id != 0:
-        try:
-            forwarded = await client.forward_messages(
-                entity=target_id,
-                messages=msg.id,
-                from_peer=event.chat_id,
-            )
-            fwd_id = forwarded[0].id if isinstance(forwarded, list) else forwarded.id
-            mark_forwarded(msg.id, event.chat_id, fwd_id)
-            logger.success(f"✅ Backup forward {msg.id} → {target_id} (nowe ID: {fwd_id})")
-        except Exception as e:
-            logger.error(f"❌ Błąd backup forwardu wiadomości {msg.id}: {e}")
-    else:
-        logger.debug("RAW_CHANNEL_ID nie ustawione — pomijam surowy backup")
-
-    # --- 5. Analiza AI (jeśli klucz ustawiony) ---
+    # --- 4. Analiza AI (jeśli klucz ustawiony) ---
     if settings.gemini_api_key:
         try:
             ai_result = await analyze_message(
@@ -186,6 +169,13 @@ async def handle_new_message(event: events.NewMessage.Event, client: TelegramCli
                 media_paths=media_paths if media_paths else None,
             )
             save_ai_analysis(msg.id, event.chat_id, ai_result)
+
+            # Zapisz strukturalne pozycje portfela tradera
+            if ai_result.get("message_type") == "PORTFOLIO_UPDATE":
+                positions = ai_result.get("portfolio_positions")
+                if positions and isinstance(positions, list) and len(positions) > 0:
+                    save_trader_positions(msg.id, positions)
+
             logger.info(
                 f"🤖 AI: {ai_result.get('message_type', '?')} | "
                 f"confidence={ai_result.get('confidence', 0):.2f} | "

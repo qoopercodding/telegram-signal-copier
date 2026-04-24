@@ -61,6 +61,18 @@ CREATE TABLE IF NOT EXISTS ai_analyses (
 """
 
 
+CREATE_TRADER_POSITIONS = """
+CREATE TABLE IF NOT EXISTS trader_positions (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    ticker          TEXT NOT NULL,
+    percentage      REAL,
+    value_pln       REAL,
+    source_message_id INTEGER,
+    created_at      TEXT NOT NULL
+);
+"""
+
+
 def get_connection() -> sqlite3.Connection:
     """Zwraca połączenie z bazą SQLite. Tworzy plik jeśli nie istnieje."""
     db_path = Path(settings.db_path)
@@ -76,6 +88,7 @@ def init_db() -> None:
     with get_connection() as conn:
         conn.execute(CREATE_RAW_MESSAGES)
         conn.execute(CREATE_AI_ANALYSES)
+        conn.execute(CREATE_TRADER_POSITIONS)
         for idx_sql in CREATE_INDEXES:
             conn.execute(idx_sql)
         conn.commit()
@@ -211,3 +224,41 @@ def get_recent_messages(limit: int = 10) -> list[sqlite3.Row]:
         return conn.execute(
             "SELECT * FROM raw_messages ORDER BY created_at DESC LIMIT ?", (limit,)
         ).fetchall()
+
+
+# ============================================================
+# Pozycje portfela tradera (strukturalne snapshoty)
+# ============================================================
+
+def save_trader_positions(message_id: int, positions: list[dict]) -> None:
+    """Zapisuje aktualny portfel tradera — zastępuje poprzedni snapshot."""
+    if not positions:
+        return
+    now = datetime.utcnow().isoformat()
+    with get_connection() as conn:
+        conn.execute("DELETE FROM trader_positions")
+        for pos in positions:
+            conn.execute(
+                """INSERT INTO trader_positions
+                       (ticker, percentage, value_pln, source_message_id, created_at)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (
+                    pos.get("ticker"),
+                    pos.get("percentage"),
+                    pos.get("value_pln"),
+                    message_id,
+                    now,
+                ),
+            )
+        conn.commit()
+    logger.info(f"💼 Portfel tradera: zapisano {len(positions)} pozycji (msg {message_id})")
+
+
+def get_latest_trader_positions() -> list[dict]:
+    """Zwraca ostatni znany portfel tradera jako listę dict."""
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT ticker, percentage, value_pln, source_message_id, created_at "
+            "FROM trader_positions ORDER BY id"
+        ).fetchall()
+        return [dict(r) for r in rows]

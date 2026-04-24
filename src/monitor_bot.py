@@ -16,6 +16,7 @@ Uruchomienie:
 import asyncio
 import json
 import os
+import re
 import shutil
 import time
 from datetime import datetime, timedelta
@@ -26,7 +27,8 @@ from telethon import TelegramClient, events
 from telethon.tl.types import Message
 
 from src.config import settings, ensure_directories, LOGS_DIR, MEDIA_DIR, DB_DIR, PROJECT_ROOT
-from src.storage import get_connection, count_messages
+from src.storage import get_connection, count_messages, get_latest_trader_positions
+from src.prices import get_share_price
 
 
 # ============================================================
@@ -103,6 +105,151 @@ def read_heartbeat() -> dict | None:
 
 
 # ============================================================
+# Advisor — kalkulator pozycji
+# ============================================================
+
+_CASH_RE = re.compile(
+    r'(\d[\d\s]*(?:[.,]\d+)?)\s*(k|tys\.?)?\s*pln',
+    re.IGNORECASE,
+)
+
+
+def parse_cash_amount(text: str) -> float | None:
+    """Wykrywa kwotę PLN w tekście: '120k PLN', '120 000 PLN', '120000pln'."""
+    m = _CASH_RE.search(text)
+    if not m:
+        return None
+    amount_str = m.group(1).replace(" ", "").replace(",", ".")
+    suffix = (m.group(2) or "").lower()
+    try:
+        amount = float(amount_str)
+        if suffix.startswith("k") or suffix.startswith("tys"):
+            amount *= 1000
+        return amount
+    except ValueError:
+        return None
+
+
+
+
+async def build_advisor_message(cash_pln: float) -> str:
+    """Oblicza ile sztuk każdego waloru kupić za cash_pln na podstawie portfela tradera."""
+    positions = get_latest_trader_positions()
+    if not positions:
+        return (
+            "⚠️ *Brak danych o portfelu tradera w bazie.*\n\n"
+            "Poczekaj aż Damian wyśle screenshot portfela — bot go przetworzy automatycznie.\n"
+            "Potem napisz ponownie ile masz PLN."
+        )
+
+    source_date = (positions[0].get("created_at") or "")[:10]
+
+    # Pobierz kursy równolegle
+    price_results: list[tuple[float | None, str]] = await asyncio.gather(
+        *[asyncio.to_thread(get_share_price, p["ticker"]) for p in positions],
+        return_exceptions=False,
+    )
+
+    lines = [
+        f"📊 *Propozycja alokacji {cash_pln:,.0f} PLN*",
+        f"_Na podstawie portfela tradera z {source_date}_",
+        "",
+    ]
+
+    total_zainwestowane = 0.0
+    any_shares = False
+
+    for pos, (price, symbol) in zip(positions, price_results):
+        ticker  = pos["ticker"]
+        pct     = pos.get("percentage") or 0.0
+        target  = cash_pln * pct / 100
+
+        if price and price > 0:
+            shares = int(target / price)
+            actual = shares * price
+            total_zainwestowane += actual
+            if shares > 0:
+                any_shares = True
+                lines.append(
+                    f"• *{ticker}* {pct:.1f}% → *{shares} szt.* "
+                    f"@ {price:.2f} PLN = *{actual:,.0f} PLN*"
+                )
+            else:
+                lines.append(
+                    f"• *{ticker}* {pct:.1f}% → za mało _(min. {price:.2f} PLN na 1 szt., "
+                    f"masz {target:.0f} PLN)_"
+                )
+        else:
+            total_zainwestowane += target
+            lines.append(
+                f"• *{ticker}* {pct:.1f}% → *{target:,.0f} PLN* _(kurs niedostępny)_"
+            )
+
+    if not any_shares:
+        lines = [
+            f"⚠️ *Kwota {cash_pln:,.0f} PLN to za mało na jakikolwiek zakup.*",
+            f"_Portfel tradera z {source_date}_",
+            "",
+        ]
+        for pos, (price, _) in zip(positions, price_results):
+            ticker = pos["ticker"]
+            pct    = pos.get("percentage") or 0.0
+            if price:
+                needed = price / (pct / 100) if pct else 0
+                lines.append(f"• *{ticker}* — 1 szt. kosztuje *{price:.2f} PLN* (potrzebujesz min. *{needed:,.0f} PLN* na tę pozycję)")
+        lines += ["", f"Napisz ponownie z większą kwotą, np. `mam 120k PLN`"]
+        return "\n".join(lines)
+
+    reszta = cash_pln - total_zainwestowane
+    lines += [
+        "",
+        f"💸 Zainwestowane: *{total_zainwestowane:,.0f} PLN*",
+    ]
+    if reszta > 0.5:
+        lines.append(f"💵 Zostaje na koncie: *{reszta:,.0f} PLN*")
+
+    return "\n".join(lines)
+
+
+async def cmd_advisor_channel(event: events.NewMessage.Event) -> None:
+    """
+    Nasłuchuje wiadomości na kanale recive-bot-investor.
+    Reaguje na:
+      - '/advisor 120000'  (komenda)
+      - wolny tekst z kwotą PLN: 'mam 120k PLN wolnej gotówki'
+    """
+    if event.message.out:
+        return  # Ignoruj własne wiadomości bota
+
+    text = (event.message.text or "").strip()
+    cash: float | None = None
+
+    if text.lower().startswith("/advisor"):
+        parts = text.split(None, 1)
+        if len(parts) == 2:
+            raw = parts[1].lower().replace("k", "000").replace(",", ".").replace(" ", "")
+            try:
+                cash = float(raw)
+            except ValueError:
+                pass
+        if not cash:
+            await event.reply("Użycie: `/advisor 120000` lub napisz np. `mam 120k PLN`")
+            return
+    else:
+        cash = parse_cash_amount(text)
+        if not cash:
+            return
+
+    logger.info(f"💡 Advisor: {cash:,.0f} PLN (chat={event.chat_id})")
+    try:
+        reply = await build_advisor_message(cash)
+        await event.reply(reply, parse_mode="markdown")
+    except Exception as exc:
+        logger.error(f"Advisor błąd: {exc}")
+        await event.reply(f"❌ Błąd kalkulatora: {exc}")
+
+
+# ============================================================
 # Komendy bota
 # ============================================================
 
@@ -116,7 +263,10 @@ async def cmd_start(event: events.NewMessage.Event) -> None:
         "  /logs — ostatnie logi\n"
         "  /disk — zużycie dysku\n"
         "  /health — pełny raport\n"
-        "  /cleanup — wyczyść stare media"
+        "  /cleanup — wyczyść stare media\n\n"
+        "**Na kanale recive-bot-investor:**\n"
+        "  /advisor 120000 — propozycja alokacji X PLN\n"
+        "  lub napisz np. `mam 120k PLN wolnej gotówki`"
     )
 
 
@@ -415,6 +565,13 @@ async def main() -> None:
     @client.on(events.CallbackQuery())
     async def _callback(event):
         await cmd_callback(event)
+
+    # Nasłuch wiadomości na kanale recive-bot-investor (advisor)
+    if settings.raw_channel_id:
+        @client.on(events.NewMessage(chats=settings.raw_channel_id))
+        async def _channel_msg(event):
+            await cmd_advisor_channel(event)
+        logger.info(f"📡 Nasłuchuję kanał {settings.raw_channel_id} (advisor)")
 
     await client.start(bot_token=settings.bot_token)
     me = await client.get_me()
