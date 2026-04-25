@@ -9,6 +9,8 @@ python-dotenv>=1.1
 
 # AI / LLM
 google-genai>=1.0         # Google Gemini API (vision + text, nowe SDK)
+anthropic>=0.40          # Claude Haiku fallback
+openai>=1.50              # GPT-4o-mini fallback
 yfinance>=0.2              # Walidacja tickerów (GPW + globalne)
 
 # HTTP

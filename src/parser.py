@@ -16,8 +16,6 @@ import json
 from pathlib import Path
 from typing import Optional
 
-from google import genai
-from google.genai import types
 from loguru import logger
 
 from src.config import settings
@@ -27,9 +25,6 @@ from src.models import (
     ClassifiedMessage,
     TradeSignal,
 )
-
-
-MODELS_TO_TRY = ["gemini-2.5-flash", "gemini-2.0-flash"]
 
 # Znane tickery GPW — szybka biała lista (bez opóźnienia sieciowego)
 _GPW_KNOWN = {
@@ -69,8 +64,9 @@ async def _validate_ticker(ticker: str) -> bool:
         return True
 
 
-def get_client() -> genai.Client:
-    """Zwraca klienta Gemini (nowe SDK google-genai)."""
+def get_client():
+    """Zwraca klienta Gemini (dla prostych jednorazowych wywołań w monitor_bot)."""
+    from google import genai
     return genai.Client(api_key=settings.gemini_api_key)
 
 
@@ -160,129 +156,72 @@ async def analyze_message(
     """
     import asyncio
 
-    if not settings.gemini_api_key:
-        logger.warning("GEMINI_API_KEY nie ustawiony — pomijam analizę AI")
-        return {
-            "message_type": "UNKNOWN",
-            "confidence": 0.0,
-            "summary": "AI niedostępne — brak API key",
-            "trade_signal": None,
-        }
+    from src.ai_providers import call_ai
 
-    # Buduj content_parts (nowe SDK: types.Part)
+    # Buduj prompt i zbierz obrazy
     prompt = _build_classify_prompt()
-    if text:
-        prompt += f"\n\nTEKST: {text}"
-    else:
-        prompt += "\n\nTEKST: (brak tekstu — tylko media)"
+    prompt += f"\n\nTEKST: {text}" if text else "\n\nTEKST: (brak tekstu — tylko media)"
 
-    content_parts: list = [types.Part.from_text(text=prompt)]
-
-    # Dodaj zdjęcia (vision)
+    images: list[bytes] = []
+    mime_types: list[str] = []
+    _mime_map = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png", ".webp": "image/webp"}
     if media_paths:
         for path_str in media_paths:
             path = Path(path_str)
-            if path.exists() and path.suffix.lower() in (".jpg", ".jpeg", ".png", ".webp"):
+            if path.exists() and path.suffix.lower() in _mime_map:
                 try:
-                    image_data = path.read_bytes()
-                    mime_type = {
-                        ".jpg": "image/jpeg",
-                        ".jpeg": "image/jpeg",
-                        ".png": "image/png",
-                        ".webp": "image/webp",
-                    }.get(path.suffix.lower(), "image/jpeg")
-                    content_parts.append(types.Part.from_bytes(data=image_data, mime_type=mime_type))
+                    images.append(path.read_bytes())
+                    mime_types.append(_mime_map[path.suffix.lower()])
                     logger.debug(f"📷 Dodano obraz do analizy: {path.name}")
                 except Exception as e:
                     logger.error(f"Błąd ładowania obrazu {path}: {e}")
 
-    ai_client = get_client()
+    raw_response = ""
+    try:
+        raw_response = await call_ai(prompt=prompt, images=images, mime_types=mime_types)
+    except Exception as e:
+        logger.error(f"❌ Wszystkie AI providers niedostępne: {e}")
+        return {"message_type": "UNKNOWN", "confidence": 0.0, "summary": f"AI niedostępne: {str(e)[:80]}", "trade_signal": None}
 
-    # Próbuj modele po kolei (fallback przy rate limit)
-    for model_name in MODELS_TO_TRY:
-        for attempt in range(3):  # Max 3 próby per model
-            try:
-                response = await ai_client.aio.models.generate_content(
-                    model=model_name,
-                    contents=content_parts,
-                )
-                raw_response = (response.text or "").strip()
-                if not raw_response:
-                    logger.warning(f"⚠️ Pusta odpowiedź od {model_name} — pomijam")
-                    continue
+    # Wyczyść ```json ... ``` jeśli model zwrócił blok kodu
+    if raw_response.startswith("```"):
+        raw_response = raw_response.split("\n", 1)[1]
+        raw_response = raw_response.rsplit("```", 1)[0].strip()
 
-                # Wyczyść response — Gemini czasem zwraca ```json ... ```
-                if raw_response.startswith("```"):
-                    raw_response = raw_response.split("\n", 1)[1]
-                    raw_response = raw_response.rsplit("```", 1)[0]
-                    raw_response = raw_response.strip()
+    try:
+        result = json.loads(raw_response)
+    except json.JSONDecodeError as e:
+        logger.error(f"❌ AI zwrócił niepoprawny JSON: {e}\nRaw: {raw_response[:200]}")
+        return {"message_type": "UNKNOWN", "confidence": 0.0, "summary": "Błąd parsowania odpowiedzi AI", "trade_signal": None}
 
-                result = json.loads(raw_response)
+    # Normalizuj ticker przez _GPW_MAP + walidacja
+    if result.get("message_type") == "TRADE_ACTION":
+        ts = result.get("trade_signal") or {}
+        raw_ticker = ts.get("ticker")
+        if raw_ticker:
+            from src.prices import resolve_ticker
+            normalized = resolve_ticker(raw_ticker)
+            if normalized != raw_ticker:
+                logger.debug(f"🔁 Ticker normalizacja: {raw_ticker} → {normalized}")
+                ts["ticker"] = normalized
+            valid = await _validate_ticker(normalized)
+            if not valid:
+                logger.warning(f"⚠️ Ticker {normalized} nieznany — obniżam confidence do 0.1")
+                result["confidence"] = 0.1
+                result["summary"] = f"[NIEZNANY TICKER: {normalized}] " + result.get("summary", "")
 
-                # Normalizuj ticker przez _GPW_MAP (np. "Polsat" → "CPS")
-                if result.get("message_type") == "TRADE_ACTION":
-                    ts = result.get("trade_signal") or {}
-                    raw_ticker = ts.get("ticker")
-                    if raw_ticker:
-                        from src.prices import resolve_ticker
-                        normalized = resolve_ticker(raw_ticker)
-                        if normalized != raw_ticker:
-                            logger.debug(f"🔁 Ticker normalizacja: {raw_ticker} → {normalized}")
-                            ts["ticker"] = normalized
-                        # Walidacja — kara za zmyślone spółki
-                        valid = await _validate_ticker(normalized)
-                        if not valid:
-                            logger.warning(f"⚠️ Ticker {normalized} nie znaleziony — obniżam confidence do 0.1")
-                            result["confidence"] = 0.1
-                            result["summary"] = f"[NIEZNANY TICKER: {normalized}] " + result.get("summary", "")
+    # Jeśli AI wykryło IKE/IKZE ze screenshota → propaguj jako source_topic
+    detected_account = result.get("detected_account_type")
+    if detected_account in ("IKE", "IKZE") and not result.get("source_topic"):
+        result["source_topic"] = detected_account
+        logger.debug(f"🏷  AI wykryło konto ze screenshota: {detected_account}")
 
-                # Jeśli AI wykryło IKE/IKZE ze screenshota → propaguj jako source_topic
-                detected_account = result.get("detected_account_type")
-                if detected_account in ("IKE", "IKZE") and not result.get("source_topic"):
-                    result["source_topic"] = detected_account
-                    logger.debug(f"🏷  AI wykryło konto ze screenshota: {detected_account}")
-
-                logger.info(
-                    f"🤖 AI ({model_name}): {result.get('message_type', '?')} "
-                    f"(confidence={result.get('confidence', 0):.2f}) "
-                    f"— {result.get('summary', '?')[:80]}"
-                )
-                return result
-
-            except json.JSONDecodeError as e:
-                logger.error(f"❌ AI zwrócił niepoprawny JSON: {e}\nRaw: {raw_response[:200]}")
-                return {
-                    "message_type": "UNKNOWN",
-                    "confidence": 0.0,
-                    "summary": "Błąd parsowania odpowiedzi AI",
-                    "trade_signal": None,
-                }
-            except Exception as e:
-                error_str = str(e)
-                if "429" in error_str or "quota" in error_str.lower():
-                    wait = (attempt + 1) * 15  # 15s, 30s, 45s
-                    logger.warning(f"⏳ Rate limit ({model_name}) — czekam {wait}s (próba {attempt+1}/3)")
-                    await asyncio.sleep(wait)
-                    continue
-                else:
-                    logger.error(f"❌ Błąd Gemini API ({model_name}): {e}")
-                    return {
-                        "message_type": "UNKNOWN",
-                        "confidence": 0.0,
-                        "summary": f"Błąd API: {str(e)[:100]}",
-                        "trade_signal": None,
-                    }
-
-        logger.warning(f"🔄 Model {model_name} wyczerpany — próbuję następny")
-
-    # Wszystkie modele wyczerpane
-    logger.error("❌ Wszystkie modele Gemini zwróciły rate limit")
-    return {
-        "message_type": "UNKNOWN",
-        "confidence": 0.0,
-        "summary": "Rate limit — spróbuj za chwilę",
-        "trade_signal": None,
-    }
+    logger.info(
+        f"🤖 AI: {result.get('message_type', '?')} "
+        f"(confidence={result.get('confidence', 0):.2f}) "
+        f"— {result.get('summary', '?')[:80]}"
+    )
+    return result
 
 
 # ============================================================

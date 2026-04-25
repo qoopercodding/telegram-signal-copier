@@ -36,6 +36,8 @@ class Settings(BaseSettings):
 
     # --- AI ---
     gemini_api_key: str = ""
+    anthropic_api_key: str = ""   # Claude Haiku fallback
+    openai_api_key: str = ""      # GPT-4o-mini fallback
 
     # --- Portfolio ---
     my_portfolio_size: float = 100_000.0    # PLN
