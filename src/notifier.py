@@ -99,9 +99,12 @@ def _build_message(ai_result: dict) -> str:
     confidence = ai_result.get("confidence", 0.0)
     summary    = ai_result.get("summary", "brak opisu")
 
+    source_topic = ai_result.get("source_topic")
+    topic_label  = f" `[{source_topic}]`" if source_topic else ""
+
     if msg_type == "PORTFOLIO_UPDATE":
         lines = [
-            "📊 *AKTUALIZACJA PORTFELA*",
+            f"📊 *AKTUALIZACJA PORTFELA{topic_label}*",
             "",
             f"📝 {summary}",
             "",
@@ -120,7 +123,7 @@ def _build_message(ai_result: dict) -> str:
     emoji, action_pl = ACTION_LABELS.get(action, ("⚪", action))
     ticker_disp = f"`{ticker}`" if ticker else "nieznany"
 
-    lines = [f"{emoji} *SYGNAŁ TRADERA: {action_pl} {ticker or ''}*", ""]
+    lines = [f"{emoji} *SYGNAŁ TRADERA: {action_pl} {ticker or ''}{topic_label}*", ""]
 
     if ticker:
         lines.append(f"🏷  Ticker:  {ticker_disp}")

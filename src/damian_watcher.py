@@ -241,8 +241,13 @@ async def handle_new_message(event: events.NewMessage.Event, client: TelegramCli
         logger.error(f"❌ Błąd forwardu [{topic_name}] msg {msg.id}: {e}")
 
 
-async def fetch_and_forward(client: TelegramClient, topic_id: int, count: int) -> int:
-    """Pobiera ostatnie `count` wiadomości z tematu → forward do test-bot-inwestor."""
+async def fetch_and_forward(
+    client: TelegramClient, topic_id: int, count: int
+) -> tuple[int, dict[int, str]]:
+    """
+    Pobiera ostatnie `count` wiadomości z tematu → forward do test-bot-inwestor.
+    Zwraca (liczba_forwarded, {forwarded_msg_id: topic_name}).
+    """
     topic_name = TOPIC_NAMES.get(topic_id, str(topic_id))
     logger.info(f"📥 Pobieranie ostatnich {count} wiadomości z [{topic_name}]...")
 
@@ -256,25 +261,29 @@ async def fetch_and_forward(client: TelegramClient, topic_id: int, count: int) -
 
     if not message_ids:
         logger.warning(f"Brak wiadomości w [{topic_name}]")
-        return 0
+        return 0, {}
 
     message_ids.reverse()  # chronologicznie
 
     forwarded = 0
+    topic_map: dict[int, str] = {}
     for msg_id in message_ids:
         try:
-            await client.forward_messages(
+            fwd = await client.forward_messages(
                 entity=STAGING_CHANNEL,
                 messages=msg_id,
                 from_peer=DAMIAN_GROUP_ID,
             )
+            if fwd:
+                fwd_id = (fwd[0] if isinstance(fwd, list) else fwd).id
+                topic_map[fwd_id] = topic_name
             forwarded += 1
             await asyncio.sleep(0.3)
         except Exception as e:
             logger.error(f"❌ Błąd forwardu msg {msg_id}: {e}")
 
     logger.success(f"✅ Fetch [{topic_name}]: {forwarded}/{len(message_ids)} → test-bot-inwestor")
-    return forwarded
+    return forwarded, topic_map
 
 
 async def handle_user_command(event: events.NewMessage.Event, client: TelegramClient) -> None:

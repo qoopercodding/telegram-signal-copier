@@ -168,6 +168,12 @@ async def handle_new_message(event: events.NewMessage.Event, client: TelegramCli
                 text=msg.text or None,
                 media_paths=media_paths if media_paths else None,
             )
+            # Dołącz źródło (IKE/IKZE) jeśli wiadomość pochodzi z grupy Damiana
+            source_topic = _damian_topic_map.pop(msg.id, None)
+            if source_topic:
+                ai_result["source_topic"] = source_topic
+                logger.info(f"🏷  Źródło: {source_topic}")
+
             save_ai_analysis(msg.id, event.chat_id, ai_result)
 
             # Zapisz strukturalne pozycje portfela tradera
@@ -205,6 +211,7 @@ HEARTBEAT_FILE = LOGS_DIR.parent / ".heartbeat"
 
 _last_message_at: str = "brak"
 _start_time = None
+_damian_topic_map: dict[int, str] = {}  # forwarded_msg_id → "IKE" / "IKZE"
 
 
 def write_heartbeat() -> None:
@@ -297,11 +304,14 @@ async def main() -> None:
                 return
             topic_name = TOPIC_NAMES.get(get_topic_id(msg), "?")
             try:
-                await client.forward_messages(
+                fwd = await client.forward_messages(
                     entity=settings.source_group_id,
                     messages=msg.id,
                     from_peer=settings.damian_group_id,
                 )
+                if fwd:
+                    fwd_id = (fwd[0] if isinstance(fwd, list) else fwd).id
+                    _damian_topic_map[fwd_id] = topic_name
                 logger.info(f"📩 Damian [{topic_name}] msg {msg.id} → test-bot-inwestor")
             except Exception as e:
                 logger.error(f"❌ Forward Damian [{topic_name}] msg {msg.id}: {e}")
@@ -318,7 +328,8 @@ async def main() -> None:
             await _bot_reply(f"⏳ Pobieram *{count}* wiadomości z *{topic_name}*...")
 
             try:
-                forwarded = await fetch_and_forward(client, topic_id, count)
+                forwarded, topic_map = await fetch_and_forward(client, topic_id, count)
+                _damian_topic_map.update(topic_map)
                 if forwarded > 0:
                     await _bot_reply(
                         f"✅ Przesłano *{forwarded}/{count}* wiadomości z *{topic_name}* → test-bot-inwestor\n"
