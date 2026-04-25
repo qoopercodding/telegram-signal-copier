@@ -297,24 +297,43 @@ async def main() -> None:
                     json={"chat_id": settings.raw_channel_id, "text": text, "parse_mode": "Markdown"},
                 )
 
+        async def _process_damian_msg(msg: Message, topic_name: str) -> None:
+            """Pobiera media i analizuje wiadomość z grupy Damiana przez AI."""
+            media_paths = await download_media(msg, client)
+            if not settings.gemini_api_key:
+                return
+            try:
+                ai_result = await analyze_message(
+                    text=msg.text or None,
+                    media_paths=media_paths or None,
+                )
+                ai_result["source_topic"] = topic_name
+                save_ai_analysis(msg.id, settings.damian_group_id, ai_result)
+
+                if ai_result.get("message_type") == "PORTFOLIO_UPDATE":
+                    positions = ai_result.get("portfolio_positions")
+                    if positions:
+                        save_trader_positions(msg.id, positions)
+
+                msg_type   = ai_result.get("message_type")
+                confidence = ai_result.get("confidence", 0.0)
+                logger.info(
+                    f"🤖 [{topic_name}] AI: {msg_type} | "
+                    f"confidence={confidence:.2f} | {ai_result.get('summary','?')[:80]}"
+                )
+                if msg_type in ("TRADE_ACTION", "PORTFOLIO_UPDATE") and confidence >= 0.6:
+                    await send_signal_notification(msg.id, ai_result, media_paths)
+            except Exception as e:
+                logger.error(f"❌ AI analiza Damian [{topic_name}] msg {msg.id}: {e}")
+
         @client.on(events.NewMessage(chats=settings.damian_group_id))
         async def _damian_handler(event: events.NewMessage.Event) -> None:
             msg = event.message
             if not is_watched_topic(msg):
                 return
             topic_name = TOPIC_NAMES.get(get_topic_id(msg), "?")
-            try:
-                fwd = await client.forward_messages(
-                    entity=settings.source_group_id,
-                    messages=msg.id,
-                    from_peer=settings.damian_group_id,
-                )
-                if fwd:
-                    fwd_id = (fwd[0] if isinstance(fwd, list) else fwd).id
-                    _damian_topic_map[fwd_id] = topic_name
-                logger.info(f"📩 Damian [{topic_name}] msg {msg.id} → test-bot-inwestor")
-            except Exception as e:
-                logger.error(f"❌ Forward Damian [{topic_name}] msg {msg.id}: {e}")
+            logger.info(f"📩 Damian [{topic_name}] nowa wiadomość id={msg.id}")
+            await _process_damian_msg(msg, topic_name)
 
         @client.on(events.NewMessage(chats=settings.raw_channel_id))
         async def _fetch_handler(event: events.NewMessage.Event) -> None:
@@ -325,24 +344,36 @@ async def main() -> None:
 
             topic_name = TOPIC_NAMES[topic_id]
             logger.info(f"📋 /fetch [{topic_name}] x{count} — zaczynam")
-            await _bot_reply(f"⏳ Pobieram *{count}* wiadomości z *{topic_name}*...")
+            await _bot_reply(f"⏳ Pobieram i analizuję *{count}* wiadomości z *{topic_name}*...")
 
             try:
-                forwarded, topic_map = await fetch_and_forward(client, topic_id, count)
-                _damian_topic_map.update(topic_map)
-                if forwarded > 0:
+                msgs: list[Message] = []
+                async for m in client.iter_messages(
+                    entity=settings.damian_group_id,
+                    reply_to=topic_id,
+                    limit=count,
+                ):
+                    msgs.append(m)
+
+                if not msgs:
                     await _bot_reply(
-                        f"✅ Przesłano *{forwarded}/{count}* wiadomości z *{topic_name}* → test-bot-inwestor\n"
-                        f"_AI przeanalizuje i wyśle wyniki tutaj._"
+                        f"⚠️ Brak wiadomości w *{topic_name}*\n"
+                        f"_Sprawdź czy konto ma dostęp do grupy Damiana "
+                        f"(topic ID: {topic_id})._"
                     )
-                else:
-                    await _bot_reply(
-                        f"⚠️ Pobrano *0* wiadomości z *{topic_name}*\n"
-                        f"_Możliwe przyczyny: brak dostępu do grupy Damiana, "
-                        f"zły topic ID ({topic_id}), lub temat jest pusty._"
-                    )
+                    return
+
+                msgs.reverse()
+                for m in msgs:
+                    await _process_damian_msg(m, topic_name)
+                    await asyncio.sleep(0.3)
+
+                await _bot_reply(
+                    f"✅ Przeanalizowano *{len(msgs)}* wiadomości z *{topic_name}*\n"
+                    f"_Powiadomienia o sygnałach pojawiły się powyżej._"
+                )
             except Exception as e:
-                logger.error(f"❌ fetch_and_forward błąd: {e}")
+                logger.error(f"❌ /fetch [{topic_name}] błąd: {e}")
                 await _bot_reply(f"❌ Błąd pobierania z *{topic_name}*:\n`{e}`")
 
         logger.info(f"   Damian:    {settings.damian_group_id} (IKE:{settings.damian_ike_topic_id} IKZE:{settings.damian_ikze_topic_id})")
