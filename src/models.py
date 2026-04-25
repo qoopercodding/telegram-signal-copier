@@ -26,8 +26,9 @@ class MessageType(str, Enum):
     """Typ wiadomości rozpoznany przez AI classifier."""
     PORTFOLIO_UPDATE = "PORTFOLIO_UPDATE"       # Screenshot/tekst z aktualnym portfelem
     TRADE_ACTION = "TRADE_ACTION"               # Kupno/sprzedaż/dobranie
-    TRANSACTION_HISTORY = "TRANSACTION_HISTORY" # Tabela transakcji z brokera
-    COMMENT = "COMMENT"                         # Komentarz bez sygnału
+    TRANSACTION_HISTORY = "TRANSACTION_HISTORY" # Tabela transakcji z brokera (historia, nie aktualne pozycje)
+    INFORMATIONAL = "INFORMATIONAL"             # Komentarz rynkowy bez akcji — nie wysyłaj powiadomienia
+    COMMENT = "COMMENT"                         # Komentarz bez sygnału (alias dla INFORMATIONAL)
     UNKNOWN = "UNKNOWN"                         # Nie da się sklasyfikować
 
 

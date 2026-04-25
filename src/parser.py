@@ -96,23 +96,34 @@ Twoim zadaniem jest:
 2. Wyciągnąć sygnał tradingowy (jeśli jest)
 
 TYPY WIADOMOŚCI:
-- TRADE_ACTION — trader kupuje/sprzedaje/dodaje/redukuje pozycję
-- PORTFOLIO_UPDATE — screenshot lub tekst z aktualnym stanem portfela
-- TRANSACTION_HISTORY — tabela transakcji z brokera
-- COMMENT — komentarz, opinia, bez akcji
+- TRADE_ACTION — trader WŁAŚNIE kupuje/sprzedaje/dodaje/redukuje pozycję (akcja w czasie teraźniejszym lub przeszłym bieżąca)
+- PORTFOLIO_UPDATE — screenshot lub tekst pokazujący AKTUALNY stan portfela (jakie spółki trader TERAZ trzyma i w jakiej proporcji)
+- TRANSACTION_HISTORY — tabela/historia transakcji z brokera (przeszłe transakcje, nie aktualny stan)
+- INFORMATIONAL — komentarz rynkowy, opinia, obserwacja BEZ konkretnej akcji tradingowej
 - UNKNOWN — nie da się sklasyfikować
+
+KLUCZOWE ROZRÓŻNIENIA (najczęstsze błędy):
+- "Kupiłem 100 XTB" = TRADE_ACTION (konkretna akcja)
+- "XTB wygląda ciekawie, obserwuję" = INFORMATIONAL (nie kupuje, tylko obserwuje)
+- "PKN dalej spada" = INFORMATIONAL (komentarz rynkowy)
+- "Rynek nerwowy dziś" = INFORMATIONAL (ogólny komentarz)
+- Screenshot z listą pozycji i procentami = PORTFOLIO_UPDATE
+- Screenshot z historią transakcji (data, cena, ilość) = TRANSACTION_HISTORY
+- "Mam plan dokupić CDR" = INFORMATIONAL (plan, nie akcja)
+- "Dokupiłem CDR" = TRADE_ACTION (dokonana akcja)
 
 ODPOWIEDZ W FORMACIE JSON (TYLKO JSON, bez markdown):
 {
-    "message_type": "TRADE_ACTION | PORTFOLIO_UPDATE | COMMENT | UNKNOWN",
+    "message_type": "TRADE_ACTION | PORTFOLIO_UPDATE | TRANSACTION_HISTORY | INFORMATIONAL | UNKNOWN",
     "confidence": 0.0-1.0,
-    "summary": "krótkie streszczenie co zrozumiałeś",
+    "summary": "krótkie streszczenie co zrozumiałeś (max 120 znaków)",
+    "detected_account_type": "IKE | IKZE | null",
     "trade_signal": {
         "action": "BUY | SELL | CLOSE | REDUCE | ADD | null",
-        "ticker": "symbol akcji lub null",
+        "ticker": "ticker GPW (np. XTB, CDR, PKN) lub null — TYLKO jeśli TRADE_ACTION",
         "quantity": liczba lub null,
         "price": liczba lub null,
-        "reason": "dlaczego tak interpretujesz"
+        "reason": "krótkie uzasadnienie interpretacji"
     },
     "portfolio_positions": [
         {"ticker": "XTB", "percentage": 86.64, "value_pln": 1335500}
@@ -120,13 +131,13 @@ ODPOWIEDZ W FORMACIE JSON (TYLKO JSON, bez markdown):
 }
 
 WAŻNE ZASADY:
-- Jeśli nie jesteś pewien, ustaw confidence < 0.5
-- NIE ZGADUJ — jeśli nie ma jasnego sygnału, daj null
-- Tickery na GPW: np. XTB, PKN, KGHM, CDR, PKO, PZU, ALE, DNP, CCC, LPP
-- Trader może pisać po polsku: "kupiłem", "dokupiłem", "sprzedałem", "zamknąłem"
-- "Dobieram" = ADD, "Redukcja" = REDUCE, "Zamykam pozycję" = CLOSE
-- Jeśli jest screenshot — opisz co widzisz (portfel, transakcje, chart)
-- Dla PORTFOLIO_UPDATE: w portfolio_positions wypisz WSZYSTKIE pozycje z tickerem i % udziału (oraz value_pln jeśli widoczna). Dla innych typów wiadomości: portfolio_positions = []
+- Dla INFORMATIONAL: zawsze trade_signal = null, portfolio_positions = []
+- Dla PORTFOLIO_UPDATE: wypisz WSZYSTKIE pozycje z tickerem i % udziału (value_pln jeśli widoczna)
+- Dla innych typów: portfolio_positions = []
+- Ticker: użyj skrótu GPW (XTB, CDR, PKN, KGH), nie pełnej nazwy
+- Nazwy spółek: "Polsat"→CPS, "Orlen"→PKN, "Miedź"→KGH, "Dino"→DNP, "Pekao"→PEO
+- detected_account_type: jeśli na screenie lub w tekście widać słowo "IKE" lub "IKZE" → wpisz je; inaczej null
+- Jeśli nie jesteś pewien → confidence < 0.5, NIE ZGADUJ akcji tradingowej
 
 WIADOMOŚĆ DO ANALIZY:
 """
@@ -208,21 +219,33 @@ async def analyze_message(
 
                 result = json.loads(raw_response)
 
-                # Walidacja tickera — kara za zmyślone spółki
+                # Normalizuj ticker przez _GPW_MAP (np. "Polsat" → "CPS")
                 if result.get("message_type") == "TRADE_ACTION":
                     ts = result.get("trade_signal") or {}
-                    ticker = ts.get("ticker")
-                    if ticker:
-                        valid = await _validate_ticker(ticker)
+                    raw_ticker = ts.get("ticker")
+                    if raw_ticker:
+                        from src.prices import resolve_ticker
+                        normalized = resolve_ticker(raw_ticker)
+                        if normalized != raw_ticker:
+                            logger.debug(f"🔁 Ticker normalizacja: {raw_ticker} → {normalized}")
+                            ts["ticker"] = normalized
+                        # Walidacja — kara za zmyślone spółki
+                        valid = await _validate_ticker(normalized)
                         if not valid:
-                            logger.warning(f"⚠️ Ticker {ticker} nie znaleziony — obniżam confidence do 0.1")
+                            logger.warning(f"⚠️ Ticker {normalized} nie znaleziony — obniżam confidence do 0.1")
                             result["confidence"] = 0.1
-                            result["summary"] = f"[NIEZNANY TICKER: {ticker}] " + result.get("summary", "")
+                            result["summary"] = f"[NIEZNANY TICKER: {normalized}] " + result.get("summary", "")
+
+                # Jeśli AI wykryło IKE/IKZE ze screenshota → propaguj jako source_topic
+                detected_account = result.get("detected_account_type")
+                if detected_account in ("IKE", "IKZE") and not result.get("source_topic"):
+                    result["source_topic"] = detected_account
+                    logger.debug(f"🏷  AI wykryło konto ze screenshota: {detected_account}")
 
                 logger.info(
                     f"🤖 AI ({model_name}): {result.get('message_type', '?')} "
                     f"(confidence={result.get('confidence', 0):.2f}) "
-                    f"— {result.get('summary', '?')}"
+                    f"— {result.get('summary', '?')[:80]}"
                 )
                 return result
 
