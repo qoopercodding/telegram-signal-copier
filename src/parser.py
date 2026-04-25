@@ -16,7 +16,8 @@ import json
 from pathlib import Path
 from typing import Optional
 
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 from loguru import logger
 
 from src.config import settings
@@ -28,7 +29,7 @@ from src.models import (
 )
 
 
-MODELS_TO_TRY = ["gemini-2.5-flash", "gemini-2.0-flash-001"]
+MODELS_TO_TRY = ["gemini-2.5-flash", "gemini-2.0-flash"]
 
 # Znane tickery GPW — szybka biała lista (bez opóźnienia sieciowego)
 _GPW_KNOWN = {
@@ -68,11 +69,9 @@ async def _validate_ticker(ticker: str) -> bool:
         return True
 
 
-def get_model(model_name: str = None) -> genai.GenerativeModel:
-    """Zwraca skonfigurowany model Gemini."""
-    genai.configure(api_key=settings.gemini_api_key)
-    name = model_name or MODELS_TO_TRY[0]
-    return genai.GenerativeModel(name)
+def get_client() -> genai.Client:
+    """Zwraca klienta Gemini (nowe SDK google-genai)."""
+    return genai.Client(api_key=settings.gemini_api_key)
 
 
 # ============================================================
@@ -159,16 +158,14 @@ async def analyze_message(
             "trade_signal": None,
         }
 
-    # Buduj content_parts
-    content_parts = []
-
+    # Buduj content_parts (nowe SDK: types.Part)
     prompt = _build_classify_prompt()
     if text:
         prompt += f"\n\nTEKST: {text}"
     else:
         prompt += "\n\nTEKST: (brak tekstu — tylko media)"
 
-    content_parts.append(prompt)
+    content_parts: list = [types.Part.from_text(text=prompt)]
 
     # Dodaj zdjęcia (vision)
     if media_paths:
@@ -183,27 +180,25 @@ async def analyze_message(
                         ".png": "image/png",
                         ".webp": "image/webp",
                     }.get(path.suffix.lower(), "image/jpeg")
-
-                    content_parts.append({
-                        "mime_type": mime_type,
-                        "data": image_data,
-                    })
+                    content_parts.append(types.Part.from_bytes(data=image_data, mime_type=mime_type))
                     logger.debug(f"📷 Dodano obraz do analizy: {path.name}")
                 except Exception as e:
                     logger.error(f"Błąd ładowania obrazu {path}: {e}")
+
+    ai_client = get_client()
 
     # Próbuj modele po kolei (fallback przy rate limit)
     for model_name in MODELS_TO_TRY:
         for attempt in range(3):  # Max 3 próby per model
             try:
-                model = get_model(model_name)
-                response = await model.generate_content_async(content_parts)
-                # Handle empty parts (e.g. safety filters or incomplete responses)
-                candidate = response.candidates[0] if response.candidates else None
-                if not candidate or not candidate.content or not candidate.content.parts:
+                response = await ai_client.aio.models.generate_content(
+                    model=model_name,
+                    contents=content_parts,
+                )
+                raw_response = (response.text or "").strip()
+                if not raw_response:
                     logger.warning(f"⚠️ Pusta odpowiedź od {model_name} — pomijam")
                     continue
-                raw_response = "".join(p.text for p in candidate.content.parts if hasattr(p, "text")).strip()
 
                 # Wyczyść response — Gemini czasem zwraca ```json ... ```
                 if raw_response.startswith("```"):
