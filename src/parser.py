@@ -119,6 +119,8 @@ KLUCZOWE ROZRÓŻNIENIA (najczęstsze błędy):
 - "PKN dalej spada" = INFORMATIONAL (komentarz rynkowy)
 - "Rynek nerwowy dziś" = INFORMATIONAL (ogólny komentarz)
 - Screenshot z listą pozycji i procentami = PORTFOLIO_UPDATE
+- "Podsumowanie konta IKE/IKZE" z listą spółek i wartościami = PORTFOLIO_UPDATE (NIE informational!)
+- "Podsumowanie tygodnia w portfelu IKE" ze screenem stanu konta = PORTFOLIO_UPDATE
 - Screenshot z historią transakcji (data, cena, ilość) = TRANSACTION_HISTORY
 - "Mam plan dokupić CDR" = INFORMATIONAL (plan, nie akcja)
 - "Dokupiłem CDR" = TRADE_ACTION (dokonana akcja)
@@ -225,6 +227,17 @@ async def analyze_message(
                 logger.warning(f"⚠️ Ticker {normalized} nieznany — obniżam confidence do 0.1")
                 result["confidence"] = 0.1
                 result["summary"] = f"[NIEZNANY TICKER: {normalized}] " + result.get("summary", "")
+
+    # Normalizuj tickery w pozycjach portfela
+    if result.get("message_type") == "PORTFOLIO_UPDATE":
+        from src.prices import resolve_ticker
+        for pos in result.get("portfolio_positions") or []:
+            raw_tk = pos.get("ticker")
+            if raw_tk:
+                normalized = resolve_ticker(raw_tk)
+                if normalized != raw_tk:
+                    logger.debug(f"🔁 Portfolio ticker: {raw_tk} → {normalized}")
+                    pos["ticker"] = normalized
 
     # Jeśli AI wykryło IKE/IKZE ze screenshota → propaguj jako source_topic
     detected_account = result.get("detected_account_type")
