@@ -128,6 +128,16 @@ async def cmd_clear(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("Historia rozmowy wyczyszczona. Zaczynamy od nowa!")
 
 
+async def _send_reply(update: Update, text: str) -> None:
+    """Wysyła odpowiedź z Markdown, fallback do plain text przy błędzie parsowania."""
+    chunks = [text[i:i+4096] for i in range(0, len(text), 4096)]
+    for chunk in chunks:
+        try:
+            await update.message.reply_text(chunk, parse_mode="Markdown")
+        except Exception:
+            await update.message.reply_text(chunk)
+
+
 # --- message handler ---
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -156,12 +166,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     history.append(types.Content(role="user", parts=[types.Part(text=text)]))
     history.append(types.Content(role="model", parts=[types.Part(text=reply)]))
 
-    # Telegram ma limit 4096 znaków per wiadomość
-    if len(reply) <= 4096:
-        await update.message.reply_text(reply, parse_mode="Markdown")
-    else:
-        for i in range(0, len(reply), 4096):
-            await update.message.reply_text(reply[i:i+4096], parse_mode="Markdown")
+    await _send_reply(update, reply)
 
 
 # --- main ---
