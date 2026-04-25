@@ -491,7 +491,7 @@ async def cmd_callback(event: events.CallbackQuery.Event) -> None:
 
         logger.info(f"❌ Admin odrzucił sygnał msg_id={msg_id}")
         await event.edit(
-            f"❌ *ODRÓCONO*\n\n"
+            f"❌ *ODRZUCONO*\n\n"
             f"Sygnał (msg #{msg_id}) odrzucony.\n"
             f"_⏰ {now}_"
         )
@@ -508,11 +508,13 @@ async def cmd_callback(event: events.CallbackQuery.Event) -> None:
 # Heartbeat checker (działa w tle)
 # ============================================================
 
-async def heartbeat_checker() -> None:
+async def heartbeat_checker(client: TelegramClient) -> None:
     """
     Co 10 minut sprawdza heartbeat listenera.
-    Jeśli brak > 30 min → wysyła alert do admina.
+    Jeśli brak > 30 min → wysyła alert do admina (raz na 60 min żeby nie spamować).
     """
+    _last_alert_at: float = 0.0
+
     while True:
         await asyncio.sleep(600)  # Co 10 minut
 
@@ -522,15 +524,25 @@ async def heartbeat_checker() -> None:
 
         hb = read_heartbeat()
         if hb is None:
-            continue  # Listener jeszcze nie wysłał heartbeatu
+            continue
 
         last_hb = datetime.fromisoformat(hb["timestamp"])
         age = (datetime.utcnow() - last_hb).total_seconds()
 
         if age > 1800:  # 30 minut
             logger.warning(f"🔴 Listener martwy! Ostatni heartbeat {int(age)}s temu")
-            # Wyślij alert — ale potrzebujemy klienta; logujemy tylko
-            # Alert zostanie wysłany przy następnym /status
+            now = time.time()
+            if now - _last_alert_at > 3600:  # Alert max raz na godzinę
+                _last_alert_at = now
+                try:
+                    await client.send_message(
+                        admin_id,
+                        f"🔴 **ALERT: Listener nie żyje!**\n\n"
+                        f"Ostatni heartbeat: {int(age / 60)} min temu\n"
+                        f"_Uruchom: `sudo systemctl restart signal-copier`_",
+                    )
+                except Exception as e:
+                    logger.error(f"Błąd wysyłania alertu heartbeat: {e}")
 
 
 # ============================================================
@@ -592,7 +604,7 @@ async def main() -> None:
     logger.info(f"✅ Monitor Bot zalogowany: @{me.username}")
 
     # Uruchom heartbeat checker w tle
-    asyncio.create_task(heartbeat_checker())
+    asyncio.create_task(heartbeat_checker(client))
 
     logger.info("👂 Czekam na komendy...")
     await client.run_until_disconnected()

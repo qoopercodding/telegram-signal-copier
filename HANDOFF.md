@@ -1,7 +1,7 @@
 # HANDOFF — telegram-signal-copier
 
 > Ten dokument jest przeznaczony dla AI przejmującego pracę.
-> Zaktualizowany: 2026-04-24. Autor: Claude Sonnet 4.6.
+> Zaktualizowany: 2026-04-25. Autor: Claude Sonnet 4.6.
 
 ---
 
@@ -11,172 +11,173 @@ System kopiuje sygnały inwestycyjne od tradera **Damiana** (prywatna grupa Tele
 do kanału właściciela. Pipeline:
 
 ```
-[Damian — prywatna grupa / IKE / IKZE]
-        ↓ damian_watcher.py (NOWY — forward live)
-[test-bot-inwestor] (staging, SOURCE_GROUP_ID)
-        ↓ listener.py (AI analiza, SQLite)
+[Damian — prywatna grupa / IKE(8951) / IKZE(8953)]
+        ↓ listener.py — _damian_handler (Telethon, event)
+        ↓ listener.py — _process_damian_msg()  ← bezpośrednia analiza AI
 [recive-bot-investor] (output, RAW_CHANNEL_ID)
-        ↓ notifier.py (bot API)
-[Użytkownik (Marcin) dostaje powiadomienie]
+        ↓ notifier.py (bot API, z etykietą [IKE] lub [IKZE])
+[Marcin dostaje powiadomienie z przyciskami AKCEPTUJ/ODRZUĆ]
+
+Komenda /fetch IKE N (na recive-bot-investor):
+[_fetch_handler] → iter_messages(Damian group) → _process_damian_msg() × N → powiadomienia
 ```
 
-Użytkownik: **Marcin** — inwestor indywidualny, GPW (giełda polska). Portfolio: 100 000 PLN.
+Użytkownik: **Marcin** — inwestor indywidualny, GPW. Portfolio: 100 000 PLN.
 
 ---
 
-## 2. Pliki — co robi każdy
+## 2. WAŻNA ZMIANA ARCHITEKTURY (2026-04-25)
+
+**Poprzednio (STARE — nie działa):**
+- `damian_watcher.py` jako osobny proces forwadował wiadomości do `test-bot-inwestor`
+- `listener.py` nasłuchiwał `test-bot-inwestor` i analizował forwarded wiadomości
+- **Bug**: Telethon nie odpala `NewMessage` eventów dla wiadomości forwardowanych przez ten sam klient → AI nigdy się nie uruchamiało
+
+**Teraz (AKTUALNE — działa):**
+- Cała logika Damiana **zintegrowana w `listener.py`** (jeden proces, jedna sesja)
+- `_damian_handler` reaguje na live wiadomości z grupy Damiana → `_process_damian_msg()`
+- `_fetch_handler` reaguje na `/fetch IKE N` → `iter_messages()` → `_process_damian_msg()`
+- `_process_damian_msg()` robi: download_media → analyze_message(Gemini) → save_ai_analysis → send_signal_notification
+- `damian_watcher.py` **istnieje ale nie jest uruchamiany** — służy tylko jako biblioteka (eksportuje `is_watched_topic`, `get_topic_id`, `TOPIC_NAMES`, `parse_fetch_command`)
+
+---
+
+## 3. Pliki — co robi każdy
 
 | Plik | Rola |
 |------|------|
 | `src/config.py` | Pydantic Settings — ładuje `.env` |
-| `src/listener.py` | Telethon userbot — nasłuchuje test-bot-inwestor, wywołuje AI, notifier |
-| `src/damian_watcher.py` | **NOWY** Telethon userbot — nasłuchuje IKE/IKZE, forwarduje do test-bot-inwestor |
-| `src/parser.py` | Gemini AI — klasyfikuje wiadomości (TRADE_ACTION / PORTFOLIO_UPDATE / OTHER) |
-| `src/notifier.py` | Bot API — wysyła powiadomienia na recive-bot-investor (z przyciskami AKCEPTUJ/ODRZUĆ) |
-| `src/monitor_bot.py` | Bot API — heartbeat, /status, /portfolio, /advisor |
-| `src/prices.py` | Pobieranie kursów GPW — yfinance (.WA) + stooq.pl fallback |
-| `src/storage.py` | SQLite — wiadomości, AI analizy, pozycje tradera |
-| `src/models.py` | Pydantic modele (Signal, itp.) |
+| `src/listener.py` | **GŁÓWNY** — Telethon userbot, nasłuchuje test-bot-inwestor + grupę Damiana, AI pipeline |
+| `src/damian_watcher.py` | Biblioteka pomocnicza — helpers (`is_watched_topic`, `parse_fetch_command`) + `login_via_channel()` |
+| `src/parser.py` | Gemini AI — klasyfikuje wiadomości, waliduje tickery GPW |
+| `src/notifier.py` | Bot API — wysyła powiadomienia z przyciskami, buy list (ile sztuk @ kurs) |
+| `src/monitor_bot.py` | Bot Telethon — `/status`, `/portfolio`, `/advisor`, heartbeat, relay SMS kodów |
+| `src/prices.py` | Kursy akcji — yfinance (.WA) + stooq.pl fallback, 40+ aliasów GPW |
+| `src/storage.py` | SQLite — tabele: messages, ai_analyses, signals, trader_positions |
+| `src/models.py` | Pydantic modele |
 
 ---
 
-## 3. Klucze i ID — co gdzie
+## 4. Klucze i ID
 
 ```dotenv
 # .env (NIE commitować)
 TELEGRAM_API_ID=36661880
 TELEGRAM_API_HASH=f849584c847a5a892abd2f683838c76a
-SOURCE_GROUP_ID=-1003728819658      # test-bot-inwestor (staging)
-RAW_CHANNEL_ID=-1003925454327       # recive-bot-investor (output)
-BOT_TOKEN=8729025942:AAE...         # bot Decision / Monitor
+SOURCE_GROUP_ID=-1003728819658      # test-bot-inwestor (staging — już mniej używany)
+RAW_CHANNEL_ID=-1003925454327       # recive-bot-investor (output — główny kanał)
+BOT_TOKEN=8729025942:AAE...
 GEMINI_API_KEY=AQ.Ab8RN6JV...
 MY_PORTFOLIO_SIZE=100000
 
-# Damian's group
 DAMIAN_GROUP_ID=-1001548727545
 DAMIAN_IKE_TOPIC_ID=8951
 DAMIAN_IKZE_TOPIC_ID=8953
-DAMIAN_SESSION_NAME=damian_watcher
+USERBOT_PHONE=+48737132141
 ```
 
-**Kanały Telegram:**
-- `test-bot-inwestor`: `-1003728819658` — staging, tu trafiają forwarded wiadomości
-- `recive-bot-investor`: `-1003925454327` — output, tu Marcin widzi analizy AI
-
 **Sesje Telethon:**
-- `signal_copier.session` — używana przez `listener.py`
-- `damian_watcher.session` — używana przez `damian_watcher.py` (OSOBNA — muszą być rozdzielone!)
+- `signal_copier.session` — `listener.py` (serwis `signal-copier`)
+- `monitor_bot.session` — `monitor_bot.py` (serwis `signal-monitor`)
+- `damian_watcher.session` — NIE UŻYWANA (zrezygnowano z osobnego procesu)
 
 ---
 
-## 4. Serwisy systemd (na VM)
+## 5. Serwisy systemd
 
 ```bash
-sudo systemctl status signal-copier    # listener.py
-sudo systemctl status signal-monitor   # monitor_bot.py
-# damian-watcher.service — JESZCZE NIE WDROŻONY (TODO)
-```
+sudo systemctl status signal-copier    # listener.py — główny pipeline
+sudo systemctl status signal-monitor   # monitor_bot.py — komendy, heartbeat
 
-Restart po zmianach:
-```bash
+# Restart po zmianach kodu:
 echo '<sudo_password>' | sudo -S systemctl restart signal-copier signal-monitor
 ```
 
 ---
 
-## 5. Stan implementacji — co jest gotowe, co nie
+## 6. Stan — co działa, co nie
 
-### ✅ Gotowe i działające
-- `listener.py` — pełny pipeline (Telethon → AI → SQLite → notifier)
-- `parser.py` — Gemini AI klasyfikacja, walidacja tickerów GPW, `portfolio_positions` w JSON
-- `notifier.py` — wysyłanie foto + tekstu, buy list (ile sztuk @ kurs), przyciski AKCEPTUJ/ODRZUĆ
-- `prices.py` — 40+ aliasów GPW, yfinance + stooq.pl fallback
-- `storage.py` — tabele: messages, ai_analyses, signals, trader_positions
-- `monitor_bot.py` — `/status`, `/portfolio`, `/advisor <kwota>`, heartbeat
-- `damian_watcher.py` — **napisany, nie uruchomiony jeszcze**
+### ✅ Działa
+- `listener.py` — pełny pipeline: test-bot-inwestor + Damian IKE/IKZE → AI → powiadomienia
+- `_damian_handler` — live watch na grupę Damiana (IKE/IKZE), bezpośrednia analiza AI
+- `_fetch_handler` — `/fetch IKE N` na recive-bot-investor → analiza N wiadomości → powiadomienia z `[IKE]`/`[IKZE]` etykietą
+- `parser.py` — Gemini 2.5 Flash, walidacja tickerów, portfel 100k PLN w prompcie
+- `notifier.py` — zdjęcia + tekst, buy list (sztuki × kurs), przyciski AKCEPTUJ/ODRZUĆ
+- `prices.py` — yfinance + stooq fallback, aliasy GPW
+- `monitor_bot.py` — `/status`, `/portfolio`, `/advisor`, relay SMS kodów
 
-### ❌ TODO — jeszcze nie zrobione
-1. **Pierwsze uruchomienie `damian_watcher.py`** na VM:
-   ```bash
-   source venv/bin/activate
-   python -m src.damian_watcher
-   # Poprosi o tel + SMS → stworzy damian_watcher.session
-   ```
-2. **Systemd service dla damian_watcher** — plik w repozytorium nie istnieje, wzór w `planTelethon.md` sekcja 7
-3. **Test komendy `/fetch IKE 5`** — wpisać na recive-bot-investor, sprawdzić czy działa
-4. **Callback AKCEPTUJ/ODRZUĆ** w `monitor_bot.py` — czy faktycznie coś robi po kliknięciu?
+### ⚠️ Znane ograniczenia
+- Gemini 2.5 Flash bywa wolny (~10-30s/wiadomość) — `/fetch IKE 10` zajmuje ~2-5 min
+- yfinance bywa niedostępny dla małych spółek GPW → stooq.pl fallback
+- Callback AKCEPTUJ/ODRZUĆ loguje ale nie egzekwuje zlecenia (brak brokera API)
+
+### ❌ TODO / Nie zrobione
+- Integracja z brokerem (XTB, eMakler) — automatyczna realizacja sygnałów
+- `/fetch` z datą (np. `/fetch IKE od 2026-04-01`) — teraz tylko ostatnie N
+- Web dashboard (Streamlit / Grafana) — podgląd portfela i historii sygnałów
+- Testy jednostkowe dla `parser.py` i `prices.py`
 
 ---
 
-## 6. Architektura decyzyjna (ważne!)
+## 7. Architektura decyzyjna
 
-### Routing wiadomości
-- Jeśli `DECISION_CHAT_ID` ustawiony → powiadomienia idą tam
-- Jeśli nie → fallback na `RAW_CHANNEL_ID` (recive-bot-investor)
-- **Nie używać `.admin_chat_id`** — to był bug, już naprawiony
-
-### Duplikaty wiadomości — UWAGA
-- `listener.py` **NIE forwarduje** surowych wiadomości (był bug — usunięto)
-- Jedynym źródłem wiadomości na recive-bot-investor jest `notifier.py`
-- `damian_watcher.py` forwarduje tylko do **test-bot-inwestor** (staging), nie do output
-
-### Gemini AI model
-- Używa: `gemini-2.5-flash` (REST API przez httpx, nie SDK)
-- Endpoint: `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent`
-- Poprzedni model `gemini-2.0-flash-001` już nie działa
+### Routing powiadomień
+- `DECISION_CHAT_ID` ustawiony → powiadomienia tam
+- fallback: `RAW_CHANNEL_ID` (recive-bot-investor)
 
 ### Ticker normalizacja
-- AI zwraca długie nazwy (CDPROJEKT, CYFRPLSAT, SYNEKTIK)
-- `prices.py` ma mapę `_GPW_MAP` → normalizuje do symboli GPW (CDR, CPS, SNT)
-- yfinance szuka `{symbol}.WA` (giełda warszawska)
+- AI zwraca długie nazwy (CDPROJEKT, CYFRPLSAT) → `prices.py._GPW_MAP` normalizuje do symboli (CDR, CPS)
+- `parser.py._GPW_KNOWN` = szybka whitelist bez yfinance
+- Nieznany ticker → confidence obniżone do 0.1
+
+### Relay kodów SMS (jednorazowe — dla nowej sesji)
+- `monitor_bot.py` obserwuje `recive-bot-investor` przez Telethon
+- Widzi wiadomość z 5-6 cyframi → zapisuje do `/tmp/.damian_auth_code`
+- `login_via_channel()` w `damian_watcher.py` czyta ten plik
+- Kod musi być wysłany **ze spacjami** (`4 8 4 2 7`) — Telegram auto-unieważnia zwarte 5-cyfry
 
 ---
 
-## 7. Jak git push
+## 8. Git push
 
-Credentials zapisane w remote URL (token GitHub):
-```bash
-git push origin main
-```
-Działa bez pytania o hasło. Token ważny ~90 dni od 2026-04-24.
-
+Token zapisany w remote URL — `git push origin main` działa bez hasła.
 Remote: `https://github.com/qoopercodding/telegram-signal-copier.git`
+Token ważny ~90 dni od 2026-04-24.
 
 ---
 
-## 8. Jak testować lokalnie
+## 9. Jak testować
 
 ```bash
 cd /home/marcin/telegram-signal-copier
 source venv/bin/activate
 
-# Sprawdź import
-python -c "from src.damian_watcher import parse_fetch_command; print('OK')"
+# Import check
+python -c "from src.listener import main; print('OK')"
 
-# Uruchom listener (wymaga sesji signal_copier.session)
-python -m src.listener
+# Test parsefera komend
+python -c "from src.damian_watcher import parse_fetch_command; print(parse_fetch_command('/fetch IKE 5'))"
 
-# Uruchom watcher Damiana (wymaga sesji damian_watcher.session)
-python -m src.damian_watcher
+# Logi live
+sudo journalctl -u signal-copier -f
+sudo journalctl -u signal-monitor -f
 ```
+
+**Test end-to-end:** Wyślij `/fetch IKE 3` na kanale `recive-bot-investor`.
+Oczekiwany flow:
+1. Bot odpowiada "⏳ Pobieram i analizuję 3 wiadomości z IKE..."
+2. Gemini analizuje każdą wiadomość (~10-30s każda)
+3. Dla `TRADE_ACTION`/`PORTFOLIO_UPDATE` z confidence ≥ 0.6 → powiadomienie z `[IKE]`
+4. Bot odpowiada "✅ Przeanalizowano 3 wiadomości z IKE"
 
 ---
 
-## 9. Znane problemy i obejścia
+## 10. Znane problemy i obejścia
 
 | Problem | Rozwiązanie |
 |---------|-------------|
-| Kurs akcji niedostępny w yfinance | `prices.py` ma fallback stooq.pl |
-| AI zwraca zmyśloną spółkę | `parser.py` waliduje ticker przez yfinance, obniża confidence do 0.1 |
-| Dwie sesje Telethon na tym samym pliku .session | `damian_watcher` używa `damian_watcher.session` |
-| `gemini-2.0-flash-001` niedostępny | Zmieniono na `gemini-2.5-flash` |
-| Portfolio buy list pokazuje "0 szt." | Naprawiono — przy zerze pokazuje min. kwotę |
-
----
-
-## 10. Następne kroki (priorytet)
-
-1. Uruchomić `damian_watcher.py` na VM (pierwsze logowanie sesja SMS)
-2. Test: `/fetch IKE 5` na recive-bot-investor
-3. Stworzyć `damian-watcher.service` i wdrożyć systemd
-4. Sprawdzić działanie callback przycisków AKCEPTUJ/ODRZUĆ
+| Telethon nie odpala eventów dla własnych wiadomości outgoing | Przetwarzaj bezpośrednio, nie przez forward pipeline |
+| Gemini rate limit 429 | `parser.py` retry 3× z backoffem 15/30/45s, fallback na `gemini-2.0-flash-001` |
+| Kurs GPW niedostępny w yfinance | `prices.py` stooq.pl fallback |
+| Kod SMS auto-unieważniany przez Telegram | Wysyłaj ze spacjami: `4 8 4 2 7` |
+| `sqlite3.OperationalError: database is locked` | Nie uruchamiaj dwóch procesów z tą samą sesją `.session` |
