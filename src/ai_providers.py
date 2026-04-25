@@ -14,8 +14,8 @@ from src.config import settings
 
 # ── Provider functions ────────────────────────────────────────────────────────
 
-async def _call_gemini(prompt: str, images: list[bytes], mime_types: list[str]) -> str:
-    """Gemini 2.5-flash → 2.0-flash fallback."""
+async def _call_gemini(prompt: str, images: list[bytes], mime_types: list[str]) -> tuple[str, str]:
+    """Gemini 2.5-flash → 2.0-flash fallback. Returns (text, model_name)."""
     from google import genai
     from google.genai import types
 
@@ -36,7 +36,7 @@ async def _call_gemini(prompt: str, images: list[bytes], mime_types: list[str]) 
                 text = (response.text or "").strip()
                 if text:
                     logger.debug(f"🤖 Gemini ({model}) odpowiedział")
-                    return text
+                    return text, model
             except Exception as e:
                 err = str(e)
                 if "429" in err or "quota" in err.lower():
@@ -50,8 +50,8 @@ async def _call_gemini(prompt: str, images: list[bytes], mime_types: list[str]) 
     raise RuntimeError("Gemini: wszystkie modele wyczerpały limit")
 
 
-async def _call_claude(prompt: str, images: list[bytes], mime_types: list[str]) -> str:
-    """Anthropic Claude Haiku — fallback gdy Gemini niedostępny."""
+async def _call_claude(prompt: str, images: list[bytes], mime_types: list[str]) -> tuple[str, str]:
+    """Anthropic Claude Haiku — fallback gdy Gemini niedostępny. Returns (text, model_name)."""
     import anthropic
 
     if not settings.anthropic_api_key:
@@ -81,7 +81,7 @@ async def _call_claude(prompt: str, images: list[bytes], mime_types: list[str]) 
             text = msg.content[0].text.strip() if msg.content else ""
             if text:
                 logger.debug("🤖 Claude Haiku odpowiedział")
-                return text
+                return text, "claude-haiku-4-5"
         except Exception as e:
             err = str(e)
             if "529" in err or "overloaded" in err.lower() or "rate" in err.lower():
@@ -94,8 +94,8 @@ async def _call_claude(prompt: str, images: list[bytes], mime_types: list[str]) 
     raise RuntimeError("Claude: rate limit wyczerpany")
 
 
-async def _call_openai(prompt: str, images: list[bytes], mime_types: list[str]) -> str:
-    """OpenAI GPT-4o-mini — ostatni fallback."""
+async def _call_openai(prompt: str, images: list[bytes], mime_types: list[str]) -> tuple[str, str]:
+    """OpenAI GPT-4o-mini — ostatni fallback. Returns (text, model_name)."""
     import base64
     from openai import AsyncOpenAI
 
@@ -121,7 +121,7 @@ async def _call_openai(prompt: str, images: list[bytes], mime_types: list[str]) 
             text = (resp.choices[0].message.content or "").strip()
             if text:
                 logger.debug("🤖 GPT-4o-mini odpowiedział")
-                return text
+                return text, "gpt-4o-mini"
         except Exception as e:
             err = str(e)
             if "429" in err or "quota" in err.lower():
@@ -140,10 +140,10 @@ async def call_ai(
     prompt: str,
     images: list[bytes] | None = None,
     mime_types: list[str] | None = None,
-) -> str:
+) -> tuple[str, str]:
     """
     Wysyła prompt do AI. Próbuje kolejno: Gemini → Claude → OpenAI.
-    Zwraca tekst odpowiedzi lub rzuca RuntimeError gdy wszystkie padły.
+    Zwraca (tekst_odpowiedzi, nazwa_modelu) lub rzuca RuntimeError.
 
     Args:
         prompt: Tekst zapytania

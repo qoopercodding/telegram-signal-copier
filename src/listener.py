@@ -194,8 +194,8 @@ async def handle_new_message(event: events.NewMessage.Event, client: TelegramCli
             # --- 6. Wyślij powiadomienie docelowe (sygnał lub portfel) ---
             msg_type   = ai_result.get("message_type")
             confidence = ai_result.get("confidence", 0.0)
-            if msg_type in ("TRADE_ACTION", "PORTFOLIO_UPDATE") and confidence >= 0.6:
-                await send_signal_notification(msg.id, ai_result, media_paths)
+            if msg_type in ("TRADE_ACTION", "PORTFOLIO_UPDATE", "INFORMATIONAL") and confidence >= 0.6:
+                await send_signal_notification(msg.id, ai_result, media_paths, client)
             else:
                 logger.debug(
                     f"ℹ️ Bez powiadomienia: type={msg_type}, "
@@ -341,8 +341,8 @@ async def main() -> None:
                     f"🤖 [{topic_name}] AI: {msg_type} | "
                     f"confidence={confidence:.2f} | {ai_result.get('summary','?')[:80]}"
                 )
-                if msg_type in ("TRADE_ACTION", "PORTFOLIO_UPDATE") and confidence >= 0.6:
-                    await send_signal_notification(msg.id, ai_result, media_paths)
+                if msg_type in ("TRADE_ACTION", "PORTFOLIO_UPDATE", "INFORMATIONAL") and confidence >= 0.6:
+                    await send_signal_notification(msg.id, ai_result, media_paths, client)
             except Exception as e:
                 logger.error(f"❌ AI analiza Damian [{topic_name}] msg {msg.id}: {e}")
 

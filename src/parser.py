@@ -195,8 +195,9 @@ async def analyze_message(
                     logger.error(f"Błąd ładowania obrazu {path}: {e}")
 
     raw_response = ""
+    ai_model = ""
     try:
-        raw_response = await call_ai(prompt=prompt, images=images, mime_types=mime_types)
+        raw_response, ai_model = await call_ai(prompt=prompt, images=images, mime_types=mime_types)
     except Exception as e:
         logger.error(f"❌ Wszystkie AI providers niedostępne: {e}")
         return {"message_type": "UNKNOWN", "confidence": 0.0, "summary": f"AI niedostępne: {str(e)[:80]}", "trade_signal": None}
@@ -211,6 +212,8 @@ async def analyze_message(
     except json.JSONDecodeError as e:
         logger.error(f"❌ AI zwrócił niepoprawny JSON: {e}\nRaw: {raw_response[:200]}")
         return {"message_type": "UNKNOWN", "confidence": 0.0, "summary": "Błąd parsowania odpowiedzi AI", "trade_signal": None}
+
+    result["ai_model"] = ai_model
 
     # Normalizuj ticker przez _GPW_MAP + walidacja
     if result.get("message_type") == "TRADE_ACTION":

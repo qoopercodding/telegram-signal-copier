@@ -1,14 +1,14 @@
 """
-Signal Notifier — wysyła powiadomienia o sygnałach przez Telegram Bot API.
+Signal Notifier — wysyła powiadomienia przez Telethon (MTProto userbot).
+
+Routing: zawsze RAW_CHANNEL_ID (recive-bot-investor).
+Format: HTML, osobne wiadomości — najpierw oryginalne zdjęcie, potem analiza.
 """
 
 import asyncio
-import json
-
-import httpx
 from loguru import logger
 
-from src.config import settings, PROJECT_ROOT
+from src.config import settings
 from src.prices import get_share_price
 
 ACTION_LABELS: dict[str, tuple[str, str]] = {
@@ -19,43 +19,25 @@ ACTION_LABELS: dict[str, tuple[str, str]] = {
     "REDUCE": ("🟡", "REDUKCJA"),
 }
 
-TELEGRAM_API = "https://api.telegram.org/bot{token}/{method}"
-
 
 # ============================================================
-# Helpers — routing
-# ============================================================
-
-def _get_target_chat() -> int | None:
-    """Zwraca chat_id docelowy z .env (DECISION_CHAT_ID lub RAW_CHANNEL_ID)."""
-    if settings.decision_chat_id:
-        return settings.decision_chat_id
-    if settings.raw_channel_id:
-        return settings.raw_channel_id
-    return None
-
-
-# ============================================================
-# Helpers — ceny akcji
+# Helpers — ceny i lista zakupów
 # ============================================================
 
 async def _build_buy_list(positions: list[dict], portfolio_pln: float) -> str:
-    """
-    Dla listy pozycji portfela tradera oblicza ile sztuk kupić za portfolio_pln PLN.
-    Zwraca sformatowany tekst Markdown.
-    """
+    """Dla listy pozycji portfela tradera oblicza ile sztuk kupić za portfolio_pln PLN."""
     prices: list[tuple[float | None, str]] = await asyncio.gather(
         *[asyncio.to_thread(get_share_price, p["ticker"]) for p in positions],
         return_exceptions=False,
     )
 
-    lines = [f"📈 *CO KUPIĆ za {portfolio_pln:,.0f} PLN:*"]
+    lines = [f"📈 <b>CO KUPIĆ za {portfolio_pln:,.0f} PLN:</b>"]
     total = 0.0
     any_shares = False
 
     for pos, (price, source) in zip(positions, prices):
         ticker = pos["ticker"]
-        pct    = pos.get("percentage") or 0.0
+        pct = pos.get("percentage") or 0.0
         target = portfolio_pln * pct / 100
 
         if price and price > 0:
@@ -64,27 +46,27 @@ async def _build_buy_list(positions: list[dict], portfolio_pln: float) -> str:
             total += actual
             if shares > 0:
                 any_shares = True
-                src_tag = f" _{source}_" if source != "yfinance" else ""
+                src_tag = f" <i>{source}</i>" if source else ""
                 lines.append(
-                    f"• *{ticker}* {pct:.1f}% → *{shares} szt.* "
-                    f"@ {price:.2f} PLN = *{actual:,.0f} PLN*{src_tag}"
+                    f"• <b>{ticker}</b> {pct:.1f}% → <b>{shares} szt.</b>"
+                    f" @ {price:.2f} PLN = <b>{actual:,.0f} PLN</b>{src_tag}"
                 )
             else:
                 lines.append(
-                    f"• *{ticker}* {pct:.1f}% → za mało "
-                    f"_(min. {price:.2f} PLN/szt., masz {target:.0f} PLN)_"
+                    f"• <b>{ticker}</b> {pct:.1f}% → za mało"
+                    f" <i>(min. {price:.2f} PLN/szt., masz {target:.0f} PLN)</i>"
                 )
         else:
             total += target
             lines.append(
-                f"• *{ticker}* {pct:.1f}% → *{target:,.0f} PLN* _(kurs niedostępny)_"
+                f"• <b>{ticker}</b> {pct:.1f}% → <b>{target:,.0f} PLN</b> <i>(kurs niedostępny)</i>"
             )
 
     if any_shares:
         reszta = portfolio_pln - total
-        lines.append(f"\n💸 Zainwestowane: *{total:,.0f} PLN* / {portfolio_pln:,.0f} PLN")
+        lines.append(f"\n💸 Zainwestowane: <b>{total:,.0f} PLN</b> / {portfolio_pln:,.0f} PLN")
         if reszta > 0.5:
-            lines.append(f"💵 Reszta na koncie: *{reszta:,.0f} PLN*")
+            lines.append(f"💵 Reszta: <b>{reszta:,.0f} PLN</b>")
 
     return "\n".join(lines)
 
@@ -94,169 +76,167 @@ async def _build_buy_list(positions: list[dict], portfolio_pln: float) -> str:
 # ============================================================
 
 def _build_message(ai_result: dict) -> str:
-    """Buduje sformatowany tekst wiadomości Telegram (Markdown)."""
-    msg_type   = ai_result.get("message_type")
+    """Buduje sformatowany tekst wiadomości (HTML)."""
+    msg_type = ai_result.get("message_type")
     confidence = ai_result.get("confidence", 0.0)
-    summary    = ai_result.get("summary", "brak opisu")
-
+    summary = ai_result.get("summary", "brak opisu")
     source_topic = ai_result.get("source_topic")
-    topic_label  = f" `[{source_topic}]`" if source_topic else ""
+    ai_model = ai_result.get("ai_model", "")
+
+    topic_label = f" <code>[{source_topic}]</code>" if source_topic else ""
+    model_line = f"\n🤖 Model: <i>{ai_model}</i>" if ai_model else ""
 
     if msg_type == "PORTFOLIO_UPDATE":
-        lines = [
-            f"📊 *AKTUALIZACJA PORTFELA{topic_label}*",
+        positions = ai_result.get("portfolio_positions") or []
+        pos_lines = ""
+        if positions:
+            pos_lines = "\n" + "\n".join(
+                f"• <b>{p['ticker']}</b> {p.get('percentage', 0):.1f}%"
+                + (f" — {p['value_pln']:,.0f} PLN" if p.get("value_pln") else "")
+                for p in positions
+            )
+        return "\n".join(filter(None, [
+            f"📊 <b>AKTUALIZACJA PORTFELA{topic_label}</b>",
+            "",
+            pos_lines,
             "",
             f"📝 {summary}",
-            "",
-            f"🎯 Pewność AI: *{confidence * 100:.0f}%*",
-        ]
-        return "\n".join(lines)
+            f"🎯 Pewność AI: <b>{confidence * 100:.0f}%</b>{model_line}",
+        ]))
 
-    # --- TRADE_ACTION ---
-    ts         = ai_result.get("trade_signal") or {}
-    action     = ts.get("action", "UNKNOWN")
-    ticker     = ts.get("ticker")
-    qty        = ts.get("quantity")
-    price      = ts.get("price")
-    reason     = ts.get("reason", "")
+    if msg_type == "INFORMATIONAL":
+        return "\n".join([
+            f"ℹ️ <b>NOTATKA{topic_label}</b>",
+            "",
+            f"📝 {summary}",
+            f"🎯 Pewność AI: <b>{confidence * 100:.0f}%</b>{model_line}",
+        ])
+
+    # TRADE_ACTION
+    ts = ai_result.get("trade_signal") or {}
+    action = ts.get("action", "UNKNOWN")
+    ticker = ts.get("ticker")
+    qty = ts.get("quantity")
+    price = ts.get("price")
+    reason = ts.get("reason", "")
 
     emoji, action_pl = ACTION_LABELS.get(action, ("⚪", action))
-    ticker_disp = f"`{ticker}`" if ticker else "nieznany"
+    ticker_disp = f"<code>{ticker}</code>" if ticker else "nieznany"
 
-    lines = [f"{emoji} *SYGNAŁ TRADERA: {action_pl} {ticker or ''}{topic_label}*", ""]
+    lines = [f"{emoji} <b>SYGNAŁ: {action_pl} {ticker or ''}{topic_label}</b>", ""]
 
     if ticker:
         lines.append(f"🏷  Ticker:  {ticker_disp}")
     if qty is not None:
-        lines.append(f"📦 Ilość:   *{qty} szt.*")
+        lines.append(f"📦 Ilość:   <b>{qty} szt.</b>")
     if price is not None:
-        lines.append(f"💰 Cena:    *{price:.2f} PLN*")
-
+        lines.append(f"💰 Cena:    <b>{price:.2f} PLN</b>")
     if price and qty:
         total_val = price * qty
         portfolio = settings.my_portfolio_size
-        pct       = (total_val / portfolio * 100) if portfolio else 0
+        pct = (total_val / portfolio * 100) if portfolio else 0
         lines.append(
-            f"💼 Wartość: *{total_val:,.0f} PLN*  ({pct:.1f}% portfela {portfolio:,.0f} PLN)"
+            f"💼 Wartość: <b>{total_val:,.0f} PLN</b>  ({pct:.1f}% portfela {portfolio:,.0f} PLN)"
         )
 
-    lines += ["", f"🎯 Pewność AI: *{confidence * 100:.0f}%*", f"📝 {summary}"]
+    lines += [
+        "",
+        f"📝 {summary}",
+        f"🎯 Pewność AI: <b>{confidence * 100:.0f}%</b>{model_line}",
+    ]
 
     if reason:
         short_reason = reason[:200] + ("…" if len(reason) > 200 else "")
-        lines += ["", f"_Uzasadnienie: {short_reason}_"]
+        lines += ["", f"<i>Uzasadnienie: {short_reason}</i>"]
 
     return "\n".join(lines)
-
-
-# ============================================================
-# Wysyłanie przez Bot API
-# ============================================================
-
-async def _send_text(client: httpx.AsyncClient, chat_id: int, text: str,
-                     reply_to: int | None = None, keyboard: dict | None = None) -> int | None:
-    """Wysyła wiadomość tekstową. Zwraca message_id lub None."""
-    url = TELEGRAM_API.format(token=settings.bot_token, method="sendMessage")
-    payload: dict = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
-    if reply_to:
-        payload["reply_to_message_id"] = reply_to
-    if keyboard:
-        payload["reply_markup"] = keyboard
-    resp = await client.post(url, json=payload)
-    if resp.status_code == 200:
-        return resp.json().get("result", {}).get("message_id")
-    logger.error(f"❌ sendMessage {resp.status_code}: {resp.text[:200]}")
-    return None
-
-
-async def _send_photo(client: httpx.AsyncClient, chat_id: int, photo_path: str,
-                      caption: str, keyboard: dict | None = None) -> int | None:
-    """Wysyła zdjęcie z podpisem. Zwraca message_id lub None."""
-    url = TELEGRAM_API.format(token=settings.bot_token, method="sendPhoto")
-    short_caption = caption if len(caption) <= 1024 else caption[:1020] + "..."
-    data: dict = {"chat_id": chat_id, "caption": short_caption, "parse_mode": "Markdown"}
-    if keyboard:
-        data["reply_markup"] = json.dumps(keyboard)
-    with open(photo_path, "rb") as f:
-        resp = await client.post(url, data=data, files={"photo": f})
-    if resp.status_code == 200:
-        return resp.json().get("result", {}).get("message_id")
-    logger.error(f"❌ sendPhoto {resp.status_code}: {resp.text[:200]}")
-    return None
 
 
 # ============================================================
 # Główna funkcja
 # ============================================================
 
-async def send_signal_notification(msg_id: int, ai_result: dict, media_paths: list[str] = None) -> bool:
+async def send_signal_notification(
+    msg_id: int,
+    ai_result: dict,
+    media_paths: list[str] = None,
+    client=None,
+) -> bool:
     """
-    Wysyła powiadomienie o sygnale lub aktualizacji portfela.
+    Wysyła powiadomienie przez Telethon (MTProto) do RAW_CHANNEL_ID.
 
-    PORTFOLIO_UPDATE:
-      1. zdjęcie (jeśli jest) z krótkim podpisem
-      2. osobna wiadomość z tabelą CO KUPIĆ (ile sztuk @ aktualny kurs)
+    Kolejność:
+      1. Oryginalne zdjęcie (jeśli jest) z analizą jako podpis (caption ≤ 1024 znaków)
+         lub pełna analiza jako osobna wiadomość tekstowa gdy caption za długi/brak zdjęcia
+      2. Dla PORTFOLIO_UPDATE: osobna wiadomość z tabelą CO KUPIĆ (ilości sztuk)
 
-    TRADE_ACTION:
-      zdjęcie lub tekst + przyciski AKCEPTUJ/ODRZUĆ
+    Args:
+        client: Telethon TelegramClient (wymagany)
     """
-    if not settings.bot_token:
-        logger.warning("BOT_TOKEN nie ustawiony — pomijam powiadomienie")
+    if client is None:
+        logger.warning("Brak klienta Telethon — pomijam powiadomienie")
         return False
 
-    chat_id = _get_target_chat()
+    chat_id = settings.raw_channel_id
     if not chat_id:
-        logger.warning("Brak DECISION_CHAT_ID i RAW_CHANNEL_ID w .env — pomijam powiadomienie")
+        logger.warning("Brak RAW_CHANNEL_ID w .env — pomijam powiadomienie")
         return False
 
-    msg_type  = ai_result.get("message_type")
-    base_text = _build_message(ai_result)
+    if not settings.my_portfolio_size:
+        try:
+            await client.send_message(
+                chat_id,
+                "⚠️ <b>Ustaw MY_PORTFOLIO_SIZE w .env</b> — ile PLN chcesz zainwestować?\n"
+                "<i>(Bez tego nie mogę wyliczyć ile sztuk kupić)</i>",
+                parse_mode="html",
+            )
+        except Exception as e:
+            logger.error(f"send portfolio prompt error: {e}")
+        return False
 
-    has_photo = bool(
-        media_paths and
-        any(p.lower().endswith((".jpg", ".jpeg", ".png", ".webp")) for p in media_paths)
-    )
+    msg_type = ai_result.get("message_type")
+    text = _build_message(ai_result)
+
     photo_path = next(
         (p for p in (media_paths or []) if p.lower().endswith((".jpg", ".jpeg", ".png", ".webp"))),
         None,
     )
 
-    # Klawiatura decyzyjna — tylko TRADE_ACTION
-    keyboard: dict | None = None
-    if msg_type == "TRADE_ACTION":
-        ts     = ai_result.get("trade_signal") or {}
-        ticker = ts.get("ticker", "?")
-        action = ts.get("action", "?")
-        keyboard = {
-            "inline_keyboard": [[
-                {"text": "✅ AKCEPTUJ", "callback_data": f"accept:{msg_id}:{ticker}:{action}"},
-                {"text": "❌ ODRZUĆ",  "callback_data": f"reject:{msg_id}"},
-            ]]
-        }
-
     try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
+        sent_id = None
 
-            # ── Wyślij główną wiadomość ──────────────────────────────
-            if has_photo:
-                sent_id = await _send_photo(client, chat_id, photo_path, base_text, keyboard)
+        if photo_path:
+            # Caption limit w Telegramie: 1024 znaki
+            if len(text) <= 1024:
+                sent_msg = await client.send_file(
+                    chat_id,
+                    photo_path,
+                    caption=text,
+                    parse_mode="html",
+                )
+                sent_id = sent_msg.id
             else:
-                sent_id = await _send_text(client, chat_id, base_text, keyboard=keyboard)
+                # Wyślij zdjęcie bez podpisu, potem tekst osobno
+                photo_msg = await client.send_file(chat_id, photo_path)
+                sent_msg = await client.send_message(
+                    chat_id, text, parse_mode="html", reply_to=photo_msg.id
+                )
+                sent_id = sent_msg.id
+        else:
+            sent_msg = await client.send_message(chat_id, text, parse_mode="html")
+            sent_id = sent_msg.id
 
-            if sent_id is None:
-                return False
+        logger.info(f"📨 Powiadomienie wysłane → chat={chat_id} msg_id={msg_id} sent={sent_id}")
 
-            logger.info(f"📨 Powiadomienie wysłane → chat={chat_id} msg_id={msg_id} sent={sent_id}")
-
-            # ── Dla PORTFOLIO_UPDATE: osobna wiadomość z ilościami sztuk ──
-            if msg_type == "PORTFOLIO_UPDATE":
-                positions = ai_result.get("portfolio_positions") or []
-                if positions:
-                    buy_list = await _build_buy_list(positions, settings.my_portfolio_size)
-                    await _send_text(client, chat_id, buy_list, reply_to=sent_id)
-                    logger.info(f"📈 Buy list wysłany ({len(positions)} pozycji)")
-                else:
-                    logger.debug("Brak portfolio_positions w ai_result — pomijam buy list")
+        # Dla PORTFOLIO_UPDATE: osobna wiadomość z ilościami sztuk
+        if msg_type == "PORTFOLIO_UPDATE":
+            positions = ai_result.get("portfolio_positions") or []
+            if positions:
+                buy_list = await _build_buy_list(positions, settings.my_portfolio_size)
+                await client.send_message(chat_id, buy_list, parse_mode="html", reply_to=sent_id)
+                logger.info(f"📈 Buy list wysłany ({len(positions)} pozycji)")
+            else:
+                logger.debug("Brak portfolio_positions — pomijam buy list")
 
         return True
 
