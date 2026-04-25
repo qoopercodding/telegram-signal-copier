@@ -273,9 +273,22 @@ async def main() -> None:
         _last_message_at = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
         await handle_new_message(event, client)
 
-    # Handler 2 — wiadomości z prywatnej grupy Damiana (IKE/IKZE → forward)
+    # Handler 2 — wiadomości z prywatnej grupy Damiana (IKE/IKZE → forward live)
+    # Handler 3 — komendy /fetch z kanału recive-bot-investor
     if settings.damian_group_id:
-        from src.damian_watcher import is_watched_topic, get_topic_id, TOPIC_NAMES
+        from src.damian_watcher import (
+            is_watched_topic, get_topic_id, TOPIC_NAMES,
+            parse_fetch_command, fetch_and_forward,
+        )
+        import httpx as _httpx
+
+        async def _bot_reply(text: str) -> None:
+            """Wysyła wiadomość na recive-bot-investor przez Bot API."""
+            async with _httpx.AsyncClient(timeout=10.0) as h:
+                await h.post(
+                    f"https://api.telegram.org/bot{settings.bot_token}/sendMessage",
+                    json={"chat_id": settings.raw_channel_id, "text": text, "parse_mode": "Markdown"},
+                )
 
         @client.on(events.NewMessage(chats=settings.damian_group_id))
         async def _damian_handler(event: events.NewMessage.Event) -> None:
@@ -293,7 +306,36 @@ async def main() -> None:
             except Exception as e:
                 logger.error(f"❌ Forward Damian [{topic_name}] msg {msg.id}: {e}")
 
+        @client.on(events.NewMessage(chats=settings.raw_channel_id))
+        async def _fetch_handler(event: events.NewMessage.Event) -> None:
+            text = (event.message.text or "").strip()
+            topic_id, count = parse_fetch_command(text)
+            if not topic_id:
+                return
+
+            topic_name = TOPIC_NAMES[topic_id]
+            logger.info(f"📋 /fetch [{topic_name}] x{count} — zaczynam")
+            await _bot_reply(f"⏳ Pobieram *{count}* wiadomości z *{topic_name}*...")
+
+            try:
+                forwarded = await fetch_and_forward(client, topic_id, count)
+                if forwarded > 0:
+                    await _bot_reply(
+                        f"✅ Przesłano *{forwarded}/{count}* wiadomości z *{topic_name}* → test-bot-inwestor\n"
+                        f"_AI przeanalizuje i wyśle wyniki tutaj._"
+                    )
+                else:
+                    await _bot_reply(
+                        f"⚠️ Pobrano *0* wiadomości z *{topic_name}*\n"
+                        f"_Możliwe przyczyny: brak dostępu do grupy Damiana, "
+                        f"zły topic ID ({topic_id}), lub temat jest pusty._"
+                    )
+            except Exception as e:
+                logger.error(f"❌ fetch_and_forward błąd: {e}")
+                await _bot_reply(f"❌ Błąd pobierania z *{topic_name}*:\n`{e}`")
+
         logger.info(f"   Damian:    {settings.damian_group_id} (IKE:{settings.damian_ike_topic_id} IKZE:{settings.damian_ikze_topic_id})")
+        logger.info(f"   /fetch:    nasłuchuję na {settings.raw_channel_id}")
 
     async with client:
         me = await client.get_me()
