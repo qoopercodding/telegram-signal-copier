@@ -299,7 +299,24 @@ async def main() -> None:
 
         async def _process_damian_msg(msg: Message, topic_name: str) -> None:
             """Pobiera media i analizuje wiadomość z grupy Damiana przez AI."""
+            # Zapisz surową wiadomość — blokuje duplikaty przy wielokrotnym /fetch
+            saved = save_raw_message(
+                message_id=msg.id,
+                chat_id=settings.damian_group_id,
+                timestamp=msg.date if isinstance(msg.date, datetime) else datetime.utcnow(),
+                raw_text=msg.text or None,
+                has_media=bool(msg.media),
+                media_paths=[],
+                grouped_id=msg.grouped_id,
+            )
+            if not saved:
+                logger.debug(f"[{topic_name}] Duplikat msg {msg.id} — pomijam AI")
+                return
+
             media_paths = await download_media(msg, client)
+            if media_paths:
+                update_media_paths(msg.id, settings.damian_group_id, media_paths)
+
             if not settings.gemini_api_key:
                 return
             try:
