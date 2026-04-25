@@ -127,7 +127,8 @@ async def login_via_channel(client: TelegramClient) -> None:
     for attempt in range(1, 4):
         note = "" if attempt == 1 else f" _(próba {attempt}/3 — poprzedni był nieprawidłowy)_"
         await _bot_send(
-            f"🔑 Wpisz tutaj *5-cyfrowy kod SMS* z Telegrama{note}:"
+            f"🔑 Wpisz kod SMS *ze spacjami* np. `4 8 4 2 7`{note}\n"
+            f"_(spacje zapobiegają auto-unieważnieniu przez Telegram)_"
         )
         logger.info(f"⏳ Czekam na kod SMS (próba {attempt}/3)...")
 

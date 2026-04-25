@@ -264,7 +264,7 @@ async def main() -> None:
 
     client = build_client()
 
-    # Rejestruj handler — filtr po chat_id jeśli ustawiony
+    # Handler 1 — wiadomości z test-bot-inwestor (główny pipeline AI)
     source_filter = events.NewMessage(chats=settings.source_group_id if settings.source_group_id else None)
 
     @client.on(source_filter)
@@ -272,6 +272,28 @@ async def main() -> None:
         global _last_message_at
         _last_message_at = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
         await handle_new_message(event, client)
+
+    # Handler 2 — wiadomości z prywatnej grupy Damiana (IKE/IKZE → forward)
+    if settings.damian_group_id:
+        from src.damian_watcher import is_watched_topic, get_topic_id, TOPIC_NAMES
+
+        @client.on(events.NewMessage(chats=settings.damian_group_id))
+        async def _damian_handler(event: events.NewMessage.Event) -> None:
+            msg = event.message
+            if not is_watched_topic(msg):
+                return
+            topic_name = TOPIC_NAMES.get(get_topic_id(msg), "?")
+            try:
+                await client.forward_messages(
+                    entity=settings.source_group_id,
+                    messages=msg.id,
+                    from_peer=settings.damian_group_id,
+                )
+                logger.info(f"📩 Damian [{topic_name}] msg {msg.id} → test-bot-inwestor")
+            except Exception as e:
+                logger.error(f"❌ Forward Damian [{topic_name}] msg {msg.id}: {e}")
+
+        logger.info(f"   Damian:    {settings.damian_group_id} (IKE:{settings.damian_ike_topic_id} IKZE:{settings.damian_ikze_topic_id})")
 
     async with client:
         me = await client.get_me()

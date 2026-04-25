@@ -229,9 +229,12 @@ async def cmd_advisor_channel(event: events.NewMessage.Event) -> None:
     text = (event.message.text or "").strip()
 
     # Relay kodu SMS dla damian_watcher
-    if re.match(r"^\d{5,6}$", text) and _AUTH_REQUEST_FILE.exists():
-        _AUTH_CODE_FILE.write_text(text)
-        logger.info(f"🔑 Kod SMS '{text}' przekazany do damian_watcher")
+    # Akceptuje format z spacjami np. "4 8 4 2 7" lub bez "48427"
+    # Spacje zapobiegają auto-unieważnieniu kodu przez Telegram
+    stripped = re.sub(r"\s+", "", text)
+    if re.match(r"^\d{5,6}$", stripped) and _AUTH_REQUEST_FILE.exists():
+        _AUTH_CODE_FILE.write_text(stripped)
+        logger.info(f"🔑 Kod SMS '{stripped}' przekazany do damian_watcher")
         return
     cash: float | None = None
 
