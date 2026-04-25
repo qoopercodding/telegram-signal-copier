@@ -133,6 +133,9 @@ async def handle_new_message(event: events.NewMessage.Event, client: TelegramCli
     source_id = settings.source_group_id
     if source_id != 0 and event.chat_id != source_id:
         return  # Ignoruj wiadomości z innych czatów
+    # Jeśli SOURCE == DAMIAN_GROUP — _damian_handler obsługuje sam, nie dubluj
+    if settings.damian_group_id and event.chat_id == settings.damian_group_id:
+        return
 
     logger.info(
         f"📨 Nowa wiadomość | id={msg.id} | chat={event.chat_id} | "
@@ -287,15 +290,14 @@ async def main() -> None:
             is_watched_topic, get_topic_id, TOPIC_NAMES,
             parse_fetch_command, fetch_and_forward,
         )
-        import httpx as _httpx
-
         async def _bot_reply(text: str) -> None:
-            """Wysyła wiadomość na recive-bot-investor przez Bot API."""
-            async with _httpx.AsyncClient(timeout=10.0) as h:
-                await h.post(
-                    f"https://api.telegram.org/bot{settings.bot_token}/sendMessage",
-                    json={"chat_id": settings.raw_channel_id, "text": text, "parse_mode": "Markdown"},
-                )
+            """Wysyła wiadomość na recive-bot-investor przez MTProto (userbot)."""
+            if not settings.raw_channel_id:
+                return
+            try:
+                await client.send_message(settings.raw_channel_id, text, parse_mode="md")
+            except Exception as e:
+                logger.error(f"_bot_reply error: {e}")
 
         async def _process_damian_msg(msg: Message, topic_name: str) -> None:
             """Pobiera media i analizuje wiadomość z grupy Damiana przez AI."""
