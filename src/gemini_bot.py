@@ -6,14 +6,18 @@ import asyncio
 import logging
 import os
 from collections import defaultdict, deque
+from pathlib import Path
 
+from dotenv import load_dotenv
 from google import genai
 from google.genai import types
 from telegram import Update
 from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, filters
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "AIzaSyB-YwKGzZgrva_Eb7V2hiAJre17qfbkvKE")
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8670084856:AAFstLhq2adn9Emj9TRmeIdOEpBK99qqxqc")
+load_dotenv(Path(__file__).parent.parent / ".env")
+
+GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
+TELEGRAM_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 MODEL_NAME = "gemini-2.5-flash-preview-04-17"
 MAX_HISTORY = 10  # exchanges per user
 
