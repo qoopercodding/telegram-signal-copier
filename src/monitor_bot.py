@@ -211,10 +211,15 @@ async def build_advisor_message(cash_pln: float) -> str:
     return "\n".join(lines)
 
 
+_AUTH_CODE_FILE = Path("/tmp/.damian_auth_code")
+_AUTH_REQUEST_FILE = Path("/tmp/.damian_auth_request")
+
+
 async def cmd_advisor_channel(event: events.NewMessage.Event) -> None:
     """
     Nasłuchuje wiadomości na kanale recive-bot-investor.
     Reaguje na:
+      - 5-cyfrowy kod SMS (gdy damian_watcher czeka na logowanie)
       - '/advisor 120000'  (komenda)
       - wolny tekst z kwotą PLN: 'mam 120k PLN wolnej gotówki'
     """
@@ -222,6 +227,12 @@ async def cmd_advisor_channel(event: events.NewMessage.Event) -> None:
         return  # Ignoruj własne wiadomości bota
 
     text = (event.message.text or "").strip()
+
+    # Relay kodu SMS dla damian_watcher
+    if re.match(r"^\d{5,6}$", text) and _AUTH_REQUEST_FILE.exists():
+        _AUTH_CODE_FILE.write_text(text)
+        logger.info(f"🔑 Kod SMS '{text}' przekazany do damian_watcher")
+        return
     cash: float | None = None
 
     if text.lower().startswith("/advisor"):

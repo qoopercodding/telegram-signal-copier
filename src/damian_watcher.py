@@ -21,6 +21,7 @@ WAŻNE: używa osobnej sesji (damian_watcher.session) — nie koliduje z listene
 import asyncio
 import re
 import time
+from pathlib import Path
 
 import httpx
 from loguru import logger
@@ -28,6 +29,9 @@ from telethon import TelegramClient, events
 from telethon.tl.types import Message
 
 from src.config import settings, ensure_directories, LOGS_DIR
+
+_AUTH_CODE_FILE = Path("/tmp/.damian_auth_code")
+_AUTH_REQUEST_FILE = Path("/tmp/.damian_auth_request")
 
 
 # ── Stałe ──────────────────────────────────────────────────────────────────
@@ -73,53 +77,29 @@ async def _bot_send(text: str) -> None:
         })
 
 
-async def _get_current_offset() -> int:
-    """Pobiera aktualny offset żeby ignorować stare wiadomości."""
-    async with httpx.AsyncClient(timeout=15.0) as http:
-        resp = await http.get(f"{BOT_API}/getUpdates", params={"limit": 1, "offset": -1})
-        updates = resp.json().get("result", [])
-        if updates:
-            return updates[-1]["update_id"] + 1
-    return 0
 
-
-async def _poll_for_reply(offset: int, pattern: str, timeout: int = 120) -> str:
+async def _poll_for_reply(timeout: int = 120) -> str:
     """
-    Czeka na wiadomość pasującą do `pattern` na kanale recive-bot-investor.
-    Używa long-polling Bot API getUpdates.
+    Czeka na kod SMS przekazany przez monitor_bot.py z kanału recive-bot-investor.
+    monitor_bot widzi wiadomości (Telethon) i zapisuje kod do /tmp/.damian_auth_code.
     """
     deadline = time.time() + timeout
-    current_offset = offset
+    _AUTH_CODE_FILE.unlink(missing_ok=True)
+    _AUTH_REQUEST_FILE.touch()  # sygnał dla monitor_bot że czekamy na kod
 
-    async with httpx.AsyncClient(timeout=35.0) as http:
+    try:
         while time.time() < deadline:
-            remaining = int(deadline - time.time())
-            if remaining <= 0:
-                break
+            if _AUTH_CODE_FILE.exists():
+                code = _AUTH_CODE_FILE.read_text().strip()
+                _AUTH_CODE_FILE.unlink(missing_ok=True)
+                logger.info(f"✅ Kod odebrany z kanału: {code}")
+                return code
+            await asyncio.sleep(1)
+    finally:
+        _AUTH_REQUEST_FILE.unlink(missing_ok=True)
+        _AUTH_CODE_FILE.unlink(missing_ok=True)
 
-            resp = await http.get(f"{BOT_API}/getUpdates", params={
-                "offset": current_offset,
-                "timeout": min(20, remaining),
-                "allowed_updates": ["channel_post", "message"],
-            })
-
-            if resp.status_code != 200:
-                await asyncio.sleep(1)
-                continue
-
-            for update in resp.json().get("result", []):
-                current_offset = update["update_id"] + 1
-                post = update.get("channel_post") or update.get("message")
-                if not post:
-                    continue
-                chat_id = post.get("chat", {}).get("id")
-                if chat_id != OUTPUT_CHANNEL:
-                    continue
-                text = (post.get("text") or "").strip()
-                if re.match(pattern, text):
-                    return text
-
-    raise TimeoutError(f"Brak odpowiedzi w ciągu {timeout}s")
+    raise TimeoutError(f"Brak kodu SMS w ciągu {timeout}s")
 
 
 async def login_via_channel(client: TelegramClient) -> None:
@@ -145,7 +125,6 @@ async def login_via_channel(client: TelegramClient) -> None:
     sent = await client.send_code_request(settings.userbot_phone)
 
     for attempt in range(1, 4):
-        offset = await _get_current_offset()
         note = "" if attempt == 1 else f" _(próba {attempt}/3 — poprzedni był nieprawidłowy)_"
         await _bot_send(
             f"🔑 Wpisz tutaj *5-cyfrowy kod SMS* z Telegrama{note}:"
@@ -153,7 +132,7 @@ async def login_via_channel(client: TelegramClient) -> None:
         logger.info(f"⏳ Czekam na kod SMS (próba {attempt}/3)...")
 
         try:
-            code = await _poll_for_reply(offset, pattern=r"^\d{5,6}$", timeout=120)
+            code = await _poll_for_reply(timeout=120)
         except TimeoutError:
             await _bot_send("⏰ Minął czas oczekiwania na kod. Uruchom ponownie.")
             raise
@@ -180,10 +159,9 @@ async def login_via_channel(client: TelegramClient) -> None:
 
         except SessionPasswordNeededError:
             logger.info("🔐 Wykryto 2FA — proszę o hasło")
-            offset = await _get_current_offset()
             await _bot_send("🔐 Konto ma *2FA*\\. Wpisz tutaj hasło do Telegrama:")
             try:
-                password = await _poll_for_reply(offset, pattern=r".{3,}", timeout=120)
+                password = await _poll_for_reply(timeout=120)
             except TimeoutError:
                 await _bot_send("⏰ Minął czas oczekiwania na hasło. Uruchom ponownie.")
                 raise
