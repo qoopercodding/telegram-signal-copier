@@ -69,9 +69,10 @@ Gemini CLI automatycznie wczyta ten plik (GEMINI.md) jako kontekst projektu.
 - GitHub: https://github.com/qoopercodding/telegram-signal-copier
 - VM: marcin@Ubuntu-2404-noble-amd64-base (SSH jeśli potrzebne)
 
-**Żeby bot mógł wykonywać komendy w terminalu** — patrz `src/gemini_bot.py`,
-sekcja code execution (interpreter Pythona wbudowany w Gemini 2.5 Pro).
-Komendy shell wymagają rozszerzenia bota o handler `subprocess` — do zrobienia.
+**Żeby bot mógł wykonywać komendy w terminalu** — zaimplementowano w `src/gemini_bot.py`
+przez Function Calling (narzędzie `run_terminal_command`). Bot ma dostęp do powłoki VM 
+i może wykonywać komendy typu git, systemctl, ls itp. (tylko dla autoryzowanego Admina).
+
 
 ## TODO (priorytet)
 1. Integracja z brokerem XTB API — automatyczna realizacja sygnałów
