@@ -146,13 +146,22 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if not text:
         return
 
-    # Pokaż że bot pisze
-    await context.bot.send_chat_action(
-        chat_id=update.effective_chat.id, action="typing"
-    )
-
     history = histories[user_id]
     contents = _build_contents(history, text)
+
+    # Wysyłaj "typing..." co 4s przez cały czas oczekiwania na Gemini
+    chat_id = update.effective_chat.id
+    stop_typing = asyncio.Event()
+
+    async def keep_typing() -> None:
+        while not stop_typing.is_set():
+            await context.bot.send_chat_action(chat_id=chat_id, action="typing")
+            try:
+                await asyncio.wait_for(asyncio.shield(stop_typing.wait()), timeout=4)
+            except asyncio.TimeoutError:
+                pass
+
+    typing_task = asyncio.create_task(keep_typing())
 
     try:
         reply = await asyncio.get_event_loop().run_in_executor(
@@ -160,8 +169,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
     except Exception as exc:
         logger.error("Gemini error dla user %s: %s", user_id, exc)
+        stop_typing.set()
+        typing_task.cancel()
         await update.message.reply_text(f"Błąd Gemini: {exc}")
         return
+    finally:
+        stop_typing.set()
+        typing_task.cancel()
 
     history.append(types.Content(role="user", parts=[types.Part(text=text)]))
     history.append(types.Content(role="model", parts=[types.Part(text=reply)]))
