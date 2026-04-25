@@ -18,7 +18,7 @@ load_dotenv(Path(__file__).parent.parent / ".env")
 
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 TELEGRAM_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-MODEL_NAME = "gemini-2.5-flash-preview-04-17"
+MODEL_NAME = "gemini-2.5-flash"
 MAX_HISTORY = 10  # exchanges per user
 
 logging.basicConfig(
