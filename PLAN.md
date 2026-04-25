@@ -1,221 +1,212 @@
-# 📡 Telegram Signal Copier — Plan Projektu
+# Plan rozwoju — telegram-signal-copier
 
-## 🎯 Co budujemy?
-
-System, który:
-1. **Czyta wiadomości** z płatnej grupy Telegram (trader publikuje sygnały)
-2. **Parsuje sygnały** (BUY/SELL, ticker, ilość, cena) — nawet z nieustrukturyzowanego tekstu i screenshotów
-3. **Skaluje pozycję** do wielkości Twojego portfela
-4. **Pyta Cię o zgodę** przez Telegram bota (ACCEPT / REJECT)
-5. **Archiwizuje wszystko** w SQLite (pełna historia, możliwość debugowania)
-
-### Czego NIE robi (na razie)
-- ❌ Nie wykonuje transakcji automatycznie
-- ❌ Nie łączy się z brokerem
-- ❌ Nie obsługuje stop-lossów
+> Zaktualizowany: 2026-04-25. Każdy task = jeden commit. Status: ✅ zrobione | 🔄 w toku | ⬜ todo
 
 ---
 
-## 🏗️ Architektura
+## FAZA 1 — Ceny i rozpoznawanie tickerów GPW
+
+### T01 ⬜ Rozszerzyć _GPW_MAP o brakujące spółki
+**Cel:** Damian pisze "Polsat", "Orlen", "Dino" bez tickerów — bot musi to rozpoznać.
+**Plik:** `src/prices.py`
+**Kroki:**
+- Pobrać pełną listę spółek GPW ze stooq.com (csv ~500 spółek)
+- Wygenerować mapę {nazwa_uproszczona: ticker} dla 200+ najpopularniejszych
+- Dodać skróty: "Polsat"→CPS, "Orlen"→PKN, "Miedź"→KGH, "Pekao"→PEO, "Dino"→DNP
+
+### T02 ⬜ Fuzzy matching nazw spółek gdy nie ma w mapie
+**Cel:** "Cyfrowy Polsat" vs "CyfrowyPolsat" vs "polsat" → wszystko trafia do CPS.
+**Plik:** `src/prices.py` — nowa funkcja `fuzzy_resolve_ticker(name)`
+**Kroki:**
+- Użyć `difflib.get_close_matches()` na kluczach `_GPW_MAP`, próg 0.75
+- Fallback: zwróć oryginalną nazwę
+
+### T03 ⬜ Przestawić główne źródło cen na stooq.pl (zamiast yfinance)
+**Cel:** yfinance często nie ma małych spółek GPW; stooq.pl ma prawie wszystkie.
+**Plik:** `src/prices.py`
+**Kroki:**
+- Zmienić kolejność: stooq PIERWSZA, yfinance jako fallback (zamiana miejscami)
+- Przetestować: XTB, CPS, DNP, ALE, CDR — wszystkie powinny mieć kurs
+
+### T04 ⬜ Dodać bankier.pl jako trzecie źródło cen
+**Plik:** `src/prices.py` — nowa funkcja `_try_bankier(symbol)`
+**API:** `https://www.bankier.pl/new-charts/last-ratio?symbol={SYM}&intraday=true`
+**Kroki:**
+- Parsować JSON `{"p": kurs}` z odpowiedzi
+- Dodać do łańcucha fallback jako trzeci
+
+### T05 ⬜ AI-assisted ticker resolution gdy nazwa całkowicie nieznana
+**Cel:** Gdy fuzzy_resolve_ticker nie znajdzie → Gemini powie co to za spółka.
+**Plik:** `src/parser.py` + `src/prices.py`
+**Kroki:**
+- Krótki prompt: "Podaj ticker GPW dla: '{name}'. Odpowiedz TYLKO tickerem lub NULL."
+- Cache wyników w słowniku sesji (nie pytać 2× o to samo)
+- Wywołać gdy ticker z AI nie przechodzi walidacji yfinance
+
+---
+
+## FAZA 2 — Lepsza filtracja wiadomości
+
+### T06 ⬜ Ulepszyć prompt AI — dodać typ INFORMATIONAL
+**Cel:** "PKN dalej spada" to nie jest sygnał — nie wysyłaj powiadomienia.
+**Plik:** `src/parser.py` — `CLASSIFY_PROMPT`
+**Kroki:**
+- Dodać `INFORMATIONAL` do listy typów w prompcie z przykładami
+- Przykłady INFORMATIONAL: "Rynek nerwowy", "Obserwuję XTB", komentarze bez akcji
+- Instrukcja: dla INFORMATIONAL zawsze `trade_signal = null`, `confidence > 0.8`
+
+### T07 ⬜ Dodać INFORMATIONAL i TRANSACTION_HISTORY do MessageType enum
+**Plik:** `src/models.py`
+**Kroki:**
+- `INFORMATIONAL = "INFORMATIONAL"`
+- `TRANSACTION_HISTORY = "TRANSACTION_HISTORY"` (tabela transakcji z brokera — nie portfel)
+
+### T08 ⬜ Zapisywać screenshoty portfela do osobnej tabeli DB
+**Cel:** Historia jak portfel tradera zmieniał się w czasie.
+**Plik:** `src/storage.py` — nowa tabela `portfolio_snapshots`
+**Kolumny:** `id, message_id, chat_id, source_topic, positions_json, media_path, created_at`
+**Kroki:**
+- Dodać `CREATE TABLE IF NOT EXISTS portfolio_snapshots ...`
+- Wywołać `save_portfolio_snapshot()` gdy `PORTFOLIO_UPDATE` i jest media_path
+
+---
+
+## FAZA 3 — Interaktywność na recive-bot-investor
+
+### T09 ⬜ monitor_bot.py — obsługa zdjęć od Marcina na recive-bot-investor
+**Cel:** Marcin wysyła screenshot portfela → bot analizuje i doradza.
+**Plik:** `src/monitor_bot.py`
+**Kroki:**
+- W `cmd_advisor_channel` dodać obsługę `event.message.photo`
+- Pobierz przez Telethon `client.download_media(msg, file=tmp_path)`
+- Wywołaj `analyze_message(text=caption_or_none, media_paths=[tmp_path])`
+- Odpowiedz z kalkulatorem jeśli AI = PORTFOLIO_UPDATE
+
+### T10 ⬜ Odpowiadać na pytania tekstowe od Marcina w wolnej formie
+**Cel:** "Czy XTB wygląda teraz na kupno?" → bot odpowiada z kontekstem portfela.
+**Plik:** `src/monitor_bot.py`
+**Kroki:**
+- Gdy tekst nie pasuje do `/advisor` ani do kwoty PLN → wyślij do Gemini
+- Systemowy prompt: "Jesteś doradcą GPW. Portfel tradera (IKE): {positions_ike}. Portfel tradera (IKZE): {positions_ikze}."
+- Limit: tylko gdy wiadomość > 10 znaków (żeby nie odpowiadać na emoji/ok/tak)
+
+### T11 ⬜ Analiza wiadomości wrzuconych bezpośrednio na recive-bot-investor
+**Cel:** Forwarded/wklejony tekst od Marcina → AI analizuje jak z test-bot-inwestor.
+**Plik:** `src/monitor_bot.py`
+**Kroki:**
+- Dodać flagę w .env: `ANALYZE_USER_MESSAGES=true`
+- Gdy wiadomość od usera na recive-bot-investor i nie jest komendą → `analyze_message()`
+- Wyniki wysyłać jako reply (nie jako nowe powiadomienie)
+
+---
+
+## FAZA 4 — Multi-provider AI fallback
+
+### T12 ⬜ Nowy plik src/ai_providers.py — abstrakcja dostawcy AI
+**Cel:** Łatwa podmiana Gemini → Claude → OpenAI gdy jeden padnie.
+**Plik:** `src/ai_providers.py` (nowy)
+**Kroki:**
+- Funkcja: `async def call_ai(prompt: str, images: list[bytes], model_hint: str) -> str`
+- Każdy provider jako osobna async funkcja: `_call_gemini`, `_call_claude`, `_call_openai`
+- Łańcuch: Gemini 2.5-flash → Gemini 2.0-flash → Claude Haiku → GPT-4o-mini
+
+### T13 ⬜ Dodać Anthropic Claude jako fallback
+**Plik:** `src/ai_providers.py`
+**Kroki:**
+- `pip install anthropic` + dodać do requirements.txt
+- `_call_claude(prompt, images)` przez `anthropic.AsyncAnthropic(api_key=...)`
+- Model: `claude-haiku-4-5-20251001` (najszybszy, najtańszy)
+- Dodać `ANTHROPIC_API_KEY=""` do `.env` i `config.py`
+
+### T14 ⬜ Dodać OpenAI GPT-4o-mini jako fallback
+**Plik:** `src/ai_providers.py`
+**Kroki:**
+- `pip install openai` + dodać do requirements.txt
+- `_call_openai(prompt, images)` przez `openai.AsyncOpenAI(api_key=...)`
+- Model: `gpt-4o-mini`
+- Dodać `OPENAI_API_KEY=""` do `.env` i `config.py`
+
+### T15 ⬜ Zaktualizować parser.py — używać ai_providers
+**Plik:** `src/parser.py`
+**Kroki:**
+- Zastąpić pętlę modeli Gemini wywołaniem `call_ai(prompt, images)`
+- Zachować retry logic i JSON parsing
+- Zachować walidację tickera po wyniku AI
+
+---
+
+## FAZA 5 — IKE/IKZE niezawodność
+
+### T16 ⬜ Content-based wykrycie IKE vs IKZE ze screenshota
+**Cel:** Damian używa różnych brokerów — layout inny, ale treść zawiera "IKE"/"IKZE".
+**Plik:** `src/parser.py` — dodać do CLASSIFY_PROMPT
+**Kroki:**
+- Dodać pole `detected_account_type: "IKE" | "IKZE" | null` do JSON odpowiedzi AI
+- Instrukcja: "Sprawdź czy na screenie lub w tekście widać słowo IKE lub IKZE"
+- Jeśli wykryto → nadpisać `source_topic` w wyniku
+
+### T17 ⬜ Dodać kolumnę source_topic do ai_analyses w DB
+**Plik:** `src/storage.py`
+**Kroki:**
+- Migracja: `ALTER TABLE ai_analyses ADD COLUMN source_topic TEXT`
+- (SQLite nie ma IF NOT EXISTS dla ALTER → obsłużyć OperationalError)
+- Przy `save_ai_analysis` zapisywać `ai_result.get("source_topic")`
+
+### T18 ⬜ Kontekst historyczny — ostatnie N wiadomości z tego samego konta
+**Cel:** AI widzi poprzednie sygnały z IKE gdy analizuje nowy sygnał IKE.
+**Plik:** `src/storage.py` + `src/parser.py`
+**Kroki:**
+- `get_recent_analyses(source_topic, limit=5)` → ostatnie 5 wpisów IKE lub IKZE
+- Dodać do promptu: "Ostatnie akcje tradera z {source_topic}: {history_summary}"
+- Limit: max 400 znaków kontekstu
+
+---
+
+## FAZA 6 — Jakość i monitoring
+
+### T19 ⬜ Testy jednostkowe parser.py
+**Plik:** `tests/test_parser.py`
+**Kroki:**
+- Mock `call_ai()` (nie wysyłaj prawdziwych zapytań)
+- Test: poprawny JSON → poprawne pola, `TRADE_ACTION` z tickerem, `PORTFOLIO_UPDATE`
+- Min. 5 przypadków testowych
+
+### T20 ⬜ Testy jednostkowe prices.py
+**Plik:** `tests/test_prices.py`
+**Kroki:**
+- Mock httpx calls
+- Test: `resolve_ticker`, `fuzzy_resolve_ticker`, stooq CSV parsing
+
+### T21 ⬜ Komenda /portfolio2 — historia snapshotów IKE i IKZE
+**Plik:** `src/monitor_bot.py`
+**Kroki:**
+- Nowa komenda `/portfolio2` → ostatnie 3 snapshoty IKE i IKZE z datami
+- Format: "IKE (2026-04-24): XTB 45%, CDR 30%..."
+
+### T22 ⬜ Automatyczny cleanup mediów co 7 dni (nie 30)
+**Plik:** `src/monitor_bot.py`
+**Kroki:**
+- `MEDIA_RETENTION_DAYS = 7`
+- W heartbeat_loop: uruchom cleanup raz dziennie (sprawdź datę ostatniego)
+
+---
+
+## Kolejność (priorytety)
 
 ```
-[Grupa Telegram tradera]
-        ↓
-   Telethon Listener         ← czyta wiadomości jako user
-        ↓
-   RAW Channel               ← archiwum wszystkich wiadomości
-        ↓
-   SQLite Logger              ← zapis do bazy (raw_text, media, timestamp)
-        ↓
-   Parser (LLM-first)        ← Mistral API → Pydantic validation
-        ↓
-   Kalkulator pozycji         ← skalowanie % portfela
-        ↓
-   Decision Bot               ← Telegram bot → [ACCEPT] [REJECT]
-        ↓
-        Ty
+Sprint 1 — ceny + filtracja:   T01 T02 T03 T04 T05 T06 T07
+Sprint 2 — interaktywność:      T08 T09 T10 T11
+Sprint 3 — multi-AI:            T12 T13 T14 T15
+Sprint 4 — IKE/IKZE:            T16 T17 T18
+Sprint 5 — jakość:              T19 T20 T21 T22
 ```
 
 ---
 
-## ✅ Co mamy już zrobione
+## Zmienne środowiskowe do dodania (przy T13/T14)
 
-| Element | Status |
-|---|---|
-| Repo na GitHub | ✅ |
-| Struktura folderów lokalnie | ✅ |
-| Telethon zainstalowany | ✅ |
-| api_id i api_hash (nowe) | ✅ |
-| Google Antigravity jako IDE | ✅ |
-| Virtualenv | ⏳ do zrobienia |
-| .env z credentials | ⏳ do zrobienia |
-| Bot Token (@BotFather) | ⏳ do zrobienia |
-| Mistral API Key | ⏳ do zrobienia |
-
----
-
-## 🗺️ Plan działania — krok po kroku
-
----
-
-### ETAP 0 — Przygotowanie środowiska
-> Cel: masz działające środowisko, możesz uruchamiać kod
-
-- [ ] **0.1** Otworzyć folder projektu w Antigravity
-  - `C:\Users\Qoope\Documents\Antigravity\telegram-signal-copier`
-- [ ] **0.2** Stworzyć virtualenv i zainstalować zależności
-  ```
-  python -m venv venv
-  venv\Scripts\activate
-  pip install telethon python-dotenv
-  ```
-- [ ] **0.3** Stworzyć plik `.env` z credentials
-  ```
-  TELEGRAM_API_ID=36661880
-  TELEGRAM_API_HASH=twoj_nowy_hash
-  ```
-- [ ] **0.4** Upewnić się że `.env` jest w `.gitignore` (jest ✅)
-
----
-
-### ETAP 1 — Telethon Listener
-> Cel: widzisz wiadomości z grupy tradera w terminalu
-
-- [ ] **1.1** Stworzyć `src/listener.py` — minimalny nasłuch wszystkich wiadomości
-- [ ] **1.2** Uruchomić i zalogować się (numer telefonu + kod SMS)
-  - Powstanie plik `session.session` — nie commituj go do gita!
-- [ ] **1.3** Potwierdzić że wiadomości pojawiają się w terminalu
-- [ ] **1.4** Dodać filtr — słuchać tylko konkretnej grupy tradera
-- [ ] **1.5** Obsłużyć media_group (kilka zdjęć wysłanych naraz = jeden sygnał)
-
-**Checkpoint:** widzę nowe wiadomości tradera w terminalu w czasie rzeczywistym
-
----
-
-### ETAP 2 — RAW Channel + SQLite
-> Cel: każda wiadomość jest bezpiecznie zapisana i możliwa do odtworzenia
-
-- [ ] **2.1** Stworzyć prywatny kanał Telegram jako archiwum (RAW Channel)
-- [ ] **2.2** Listener forwarduje każdą wiadomość do RAW Channel
-- [ ] **2.3** Stworzyć `src/storage.py` — inicjalizacja SQLite, tabela `signals`
-- [ ] **2.4** Każda wiadomość zapisywana do bazy:
-  - `timestamp`, `raw_text`, `raw_channel_msg_id`, `media_paths`
-- [ ] **2.5** Pobrać i zapisać lokalnie media (zdjęcia) z wiadomości
-- [ ] **2.6** Deduplikacja po `message_id` (nie zapisuj dwa razy tego samego)
-
-**Checkpoint:** wysyłam testową wiadomość → pojawia się w RAW Channel i w SQLite
-
----
-
-### ETAP 3 — Parser sygnałów
-> Cel: z tekstu wiadomości wyciągasz strukturę: action, ticker, qty, price
-
-- [ ] **3.1** Zebrać ~20 przykładowych wiadomości od tradera (dane testowe)
-- [ ] **3.2** Zdobyć Mistral API Key (console.mistral.ai)
-- [ ] **3.3** Stworzyć `src/parser.py` — wywołanie LLM z Pydantic validation
-- [ ] **3.4** Zdefiniować model `TradeSignal` (action, ticker, qty, price, confidence)
-- [ ] **3.5** Odrzucać sygnały z `confidence < 0.8` → flaga `requires_review`
-- [ ] **3.6** Obsłużyć `null` przy niepewności (LLM nie może zgadywać)
-- [ ] **3.7** Przetestować na zebranych przykładach — mierzyć % poprawnych
-
-**Checkpoint:** parser zwraca poprawny JSON dla 80%+ przykładowych wiadomości
-
----
-
-### ETAP 4 — Kalkulator pozycji
-> Cel: wiesz ile sztuk kupić proporcjonalnie do swojego portfela
-
-- [ ] **4.1** Stworzyć `src/calculator.py`
-- [ ] **4.2** Logika: zakładasz że sygnał tradera = X% jego portfela → kupujesz X% swojego
-- [ ] **4.3** Ustawić `MAX_POSITION_PERCENT` (np. max 10% portfela na 1 pozycję)
-- [ ] **4.4** Ustawić `MIN_QUANTITY` (nie kupuj mniej niż 1 szt.)
-- [ ] **4.5** Przetestować na skrajnych wartościach (mały portfel, duży portfel)
-
-**Checkpoint:** dla sygnału BUY AAPL 100 kalkulator zwraca sensowną ilość dla Twojego portfela
-
----
-
-### ETAP 5 — Decision Bot
-> Cel: dostajesz na Telegramie rekomendację i możesz ją zatwierdzić lub odrzucić
-
-- [ ] **5.1** Stworzyć bota przez @BotFather → zapisać token do `.env`
-- [ ] **5.2** Stworzyć `src/bot.py`
-- [ ] **5.3** Bot wysyła wiadomość z rekomendacją:
-  ```
-  📊 Nowy sygnał
-  Akcja: BUY
-  Ticker: AAPL
-  Trader: 100 szt.
-  Ty: 20 szt.
-  Cena: market
-  ```
-- [ ] **5.4** Dodać przyciski [✅ ACCEPT] [❌ REJECT]
-- [ ] **5.5** Forward oryginalnej wiadomości tradera pod rekomendacją
-- [ ] **5.6** Fallback: jeśli forward zablokowany → wyślij zapisane zdjęcie lokalnie
-- [ ] **5.7** Zapisać decyzję do SQLite (`decision`, `decided_at`)
-- [ ] **5.8** TTL na sygnały — jeśli nie odpiszesz w 15 min → auto EXPIRED
-
-**Checkpoint:** dostaję wiadomość na Telegramie, klikam ACCEPT/REJECT, decyzja ląduje w bazie
-
----
-
-### ETAP 6 — Watchdog i monitoring
-> Cel: wiesz kiedy system przestał działać
-
-- [ ] **6.1** Cron / pętla co 5 minut sprawdzająca czy Telethon żyje
-- [ ] **6.2** Alert jeśli cisza z grupy tradera > 2 godziny (może coś padło)
-- [ ] **6.3** Alert jeśli LLM API nie odpowiada
-- [ ] **6.4** Restart automatyczny przy crashu (systemd na serwerze)
-
-**Checkpoint:** wyłączam internet na 10 minut → dostaję alert na Telegramie
-
----
-
-### ETAP 7 — Deployment na serwer
-> Cel: bot działa 24/7 bez Twojego komputera
-
-- [ ] **7.1** Skonfigurować SSH do własnego serwera VPS
-- [ ] **7.2** `git push` z lokalnego → `git pull` na serwerze
-- [ ] **7.3** Stworzyć `systemd` service — autostart po restarcie serwera
-- [ ] **7.4** Przetestować pełny przepływ na produkcji
-
-**Checkpoint:** wyłączam laptop → bot nadal działa i wysyła mi sygnały
-
----
-
-## 🔐 Sekrety do zebrania
-
-| Sekret | Skąd | Status |
-|---|---|---|
-| `TELEGRAM_API_ID` | my.telegram.org | ✅ masz |
-| `TELEGRAM_API_HASH` | my.telegram.org | ✅ masz (nowy) |
-| `BOT_TOKEN` | @BotFather na Telegramie | ⏳ |
-| `RAW_CHANNEL_ID` | ID kanału archiwum | ⏳ |
-| `DECISION_CHAT_ID` | Twoje chat ID | ⏳ |
-| `SOURCE_GROUP_ID` | ID grupy tradera | ⏳ |
-| `MISTRAL_API_KEY` | console.mistral.ai | ⏳ |
-
----
-
-## ⚠️ Kluczowe ryzyka (pamiętaj o tym)
-
-| Ryzyko | Jak mitygujemy |
-|---|---|
-| Regex matchuje negacje ("NOT BUY") | LLM-first, nie regex-first |
-| Stary api_hash wyciekł publicznie | Wygenerowano nowy ✅ |
-| Skalowanie po ilości bez znajomości kapitału | Skalujemy po % portfela |
-| Forward zablokowany przez grupę | Fallback: zdjęcie lokalne |
-| Bot przestaje działać bez alertu | Watchdog w Etapie 6 |
-| TTL przekroczony, stary sygnał zatwierdzony | Auto-EXPIRED po 15 min |
-
----
-
-## 🚀 Następny krok (teraz)
-
-**Etap 0.2** — w terminalu Antigravity:
-
-```bash
-python -m venv venv
-venv\Scripts\activate
-pip install telethon python-dotenv
+```dotenv
+ANTHROPIC_API_KEY=        # Claude Haiku fallback
+OPENAI_API_KEY=           # GPT-4o-mini fallback
+ANALYZE_USER_MESSAGES=false
 ```
