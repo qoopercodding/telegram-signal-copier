@@ -74,15 +74,30 @@ def get_client():
 # Prompty
 # ============================================================
 
-def _build_classify_prompt() -> str:
-    """Buduje prompt z aktualnym rozmiarem portfela użytkownika."""
+def _build_classify_prompt(source_topic: str | None = None) -> str:
+    """Buduje prompt z rozmiarem portfela i opcjonalnym kontekstem historycznym."""
+    from src.storage import get_recent_analyses
+
     portfolio_pln = settings.my_portfolio_size
     portfolio_note = (
         f"Portfel użytkownika do skalowania: {portfolio_pln:,.0f} PLN. "
         f"Dla PORTFOLIO_UPDATE — w polu 'summary' wylicz proporcjonalne kwoty dla każdej pozycji "
         f"(format: 'TICKER X% → Y PLN z Twojego portfela').\n\n"
     )
-    return portfolio_note + CLASSIFY_PROMPT
+
+    history_note = ""
+    if source_topic in ("IKE", "IKZE"):
+        recent = get_recent_analyses(source_topic, limit=4)
+        if recent:
+            lines = [f"Ostatnie sygnały z konta {source_topic} (najnowsze pierwsze):"]
+            for r in recent:
+                action = r.get("action") or r.get("message_type", "?")
+                ticker = r.get("ticker") or ""
+                summary = (r.get("summary") or "")[:60]
+                lines.append(f"  • {action} {ticker} — {summary}")
+            history_note = "\n".join(lines) + "\n\n"
+
+    return portfolio_note + history_note + CLASSIFY_PROMPT
 
 
 CLASSIFY_PROMPT = """Jesteś asystentem analizującym wiadomości z kanału tradera na polskiej giełdzie (GPW).
@@ -146,6 +161,7 @@ WIADOMOŚĆ DO ANALIZY:
 async def analyze_message(
     text: Optional[str] = None,
     media_paths: Optional[list[str]] = None,
+    source_topic: Optional[str] = None,
 ) -> dict:
     """
     Analizuje wiadomość tradera — tekst i/lub zdjęcia.
@@ -159,7 +175,7 @@ async def analyze_message(
     from src.ai_providers import call_ai
 
     # Buduj prompt i zbierz obrazy
-    prompt = _build_classify_prompt()
+    prompt = _build_classify_prompt(source_topic=source_topic)
     prompt += f"\n\nTEKST: {text}" if text else "\n\nTEKST: (brak tekstu — tylko media)"
 
     images: list[bytes] = []

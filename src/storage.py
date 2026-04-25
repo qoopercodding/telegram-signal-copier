@@ -46,19 +46,22 @@ CREATE TABLE IF NOT EXISTS ai_analyses (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     message_id      INTEGER NOT NULL,
     chat_id         INTEGER NOT NULL,
-    message_type    TEXT,                        -- TRADE_ACTION / PORTFOLIO_UPDATE / COMMENT / UNKNOWN
+    message_type    TEXT,
     confidence      REAL NOT NULL DEFAULT 0.0,
     summary         TEXT,
-    action          TEXT,                        -- BUY / SELL / CLOSE / REDUCE / ADD
+    action          TEXT,
     ticker          TEXT,
     quantity         REAL,
     price           REAL,
     reason          TEXT,
-    raw_response    TEXT,                        -- Pełna odpowiedź AI jako JSON
+    source_topic    TEXT,                        -- IKE / IKZE / null
+    raw_response    TEXT,
     created_at      TEXT NOT NULL,
     UNIQUE(message_id, chat_id)
 );
 """
+
+_MIGRATE_AI_ANALYSES = "ALTER TABLE ai_analyses ADD COLUMN source_topic TEXT"
 
 
 CREATE_TRADER_POSITIONS = """
@@ -84,13 +87,19 @@ def get_connection() -> sqlite3.Connection:
 
 
 def init_db() -> None:
-    """Tworzy tabele i indeksy jeśli nie istnieją."""
+    """Tworzy tabele i indeksy jeśli nie istnieją. Wykonuje migracje."""
     with get_connection() as conn:
         conn.execute(CREATE_RAW_MESSAGES)
         conn.execute(CREATE_AI_ANALYSES)
         conn.execute(CREATE_TRADER_POSITIONS)
         for idx_sql in CREATE_INDEXES:
             conn.execute(idx_sql)
+        # Migracja: dodaj source_topic jeśli brakuje (istniejące bazy)
+        try:
+            conn.execute(_MIGRATE_AI_ANALYSES)
+            logger.info("✅ Migracja DB: dodano kolumnę source_topic do ai_analyses")
+        except Exception:
+            pass  # Kolumna już istnieje
         conn.commit()
     logger.info(f"SQLite zainicjalizowany: {settings.db_path}")
 
@@ -187,8 +196,8 @@ def save_ai_analysis(message_id: int, chat_id: int, ai_result: dict) -> None:
                 """
                 INSERT OR REPLACE INTO ai_analyses
                     (message_id, chat_id, message_type, confidence, summary,
-                     action, ticker, quantity, price, reason, raw_response, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     action, ticker, quantity, price, reason, source_topic, raw_response, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     message_id,
@@ -201,6 +210,7 @@ def save_ai_analysis(message_id: int, chat_id: int, ai_result: dict) -> None:
                     trade.get("quantity"),
                     trade.get("price"),
                     trade.get("reason"),
+                    ai_result.get("source_topic"),
                     json.dumps(ai_result, ensure_ascii=False),
                     now,
                 ),
@@ -209,6 +219,20 @@ def save_ai_analysis(message_id: int, chat_id: int, ai_result: dict) -> None:
         logger.debug(f"AI analiza zapisana dla msg {message_id}")
     except Exception as e:
         logger.error(f"Błąd zapisu AI analizy: {e}")
+
+
+def get_recent_analyses(source_topic: str, limit: int = 5) -> list[dict]:
+    """Ostatnie N analiz AI dla danego konta (IKE/IKZE) — kontekst dla AI."""
+    with get_connection() as conn:
+        rows = conn.execute(
+            """SELECT message_type, summary, action, ticker, created_at
+               FROM ai_analyses
+               WHERE source_topic = ?
+                 AND message_type IN ('TRADE_ACTION', 'PORTFOLIO_UPDATE')
+               ORDER BY created_at DESC LIMIT ?""",
+            (source_topic, limit),
+        ).fetchall()
+        return [dict(r) for r in rows]
 
 
 def count_messages() -> int:

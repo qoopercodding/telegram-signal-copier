@@ -323,6 +323,7 @@ async def main() -> None:
                 ai_result = await analyze_message(
                     text=msg.text or None,
                     media_paths=media_paths or None,
+                    source_topic=topic_name,
                 )
                 ai_result["source_topic"] = topic_name
                 save_ai_analysis(msg.id, settings.damian_group_id, ai_result)
