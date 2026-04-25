@@ -1,0 +1,15 @@
+[Unit]
+Description=Gemini 2.5 Flash Telegram Bot
+After=network.target
+
+[Service]
+Type=simple
+User=marcin
+WorkingDirectory=/home/marcin/telegram-signal-copier
+ExecStart=/home/marcin/telegram-signal-copier/venv/bin/python -m src.gemini_bot
+Restart=on-failure
+RestartSec=10
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
