@@ -6,7 +6,7 @@
 
 ## FAZA 1 — Ceny i rozpoznawanie tickerów GPW
 
-### T01 ⬜ Rozszerzyć _GPW_MAP o brakujące spółki
+### T01 ✅ Rozszerzyć _GPW_MAP o brakujące spółki
 **Cel:** Damian pisze "Polsat", "Orlen", "Dino" bez tickerów — bot musi to rozpoznać.
 **Plik:** `src/prices.py`
 **Kroki:**
@@ -14,14 +14,14 @@
 - Wygenerować mapę {nazwa_uproszczona: ticker} dla 200+ najpopularniejszych
 - Dodać skróty: "Polsat"→CPS, "Orlen"→PKN, "Miedź"→KGH, "Pekao"→PEO, "Dino"→DNP
 
-### T02 ⬜ Fuzzy matching nazw spółek gdy nie ma w mapie
+### T02 ✅ Fuzzy matching nazw spółek gdy nie ma w mapie
 **Cel:** "Cyfrowy Polsat" vs "CyfrowyPolsat" vs "polsat" → wszystko trafia do CPS.
 **Plik:** `src/prices.py` — nowa funkcja `fuzzy_resolve_ticker(name)`
 **Kroki:**
 - Użyć `difflib.get_close_matches()` na kluczach `_GPW_MAP`, próg 0.75
 - Fallback: zwróć oryginalną nazwę
 
-### T03 ⬜ Przestawić główne źródło cen na stooq.pl (zamiast yfinance)
+### T03 ✅ Przestawić główne źródło cen na stooq.pl (zamiast yfinance)
 **Cel:** yfinance często nie ma małych spółek GPW; stooq.pl ma prawie wszystkie.
 **Plik:** `src/prices.py`
 **Kroki:**
@@ -47,7 +47,7 @@
 
 ## FAZA 2 — Lepsza filtracja wiadomości
 
-### T06 ⬜ Ulepszyć prompt AI — dodać typ INFORMATIONAL
+### T06 ✅ Ulepszyć prompt AI — dodać typ INFORMATIONAL
 **Cel:** "PKN dalej spada" to nie jest sygnał — nie wysyłaj powiadomienia.
 **Plik:** `src/parser.py` — `CLASSIFY_PROMPT`
 **Kroki:**
@@ -55,7 +55,7 @@
 - Przykłady INFORMATIONAL: "Rynek nerwowy", "Obserwuję XTB", komentarze bez akcji
 - Instrukcja: dla INFORMATIONAL zawsze `trade_signal = null`, `confidence > 0.8`
 
-### T07 ⬜ Dodać INFORMATIONAL i TRANSACTION_HISTORY do MessageType enum
+### T07 ✅ Dodać INFORMATIONAL i TRANSACTION_HISTORY do MessageType enum
 **Plik:** `src/models.py`
 **Kroki:**
 - `INFORMATIONAL = "INFORMATIONAL"`
@@ -73,7 +73,7 @@
 
 ## FAZA 3 — Interaktywność na recive-bot-investor
 
-### T09 ⬜ monitor_bot.py — obsługa zdjęć od Marcina na recive-bot-investor
+### T09 ✅ monitor_bot.py — obsługa zdjęć od Marcina na recive-bot-investor
 **Cel:** Marcin wysyła screenshot portfela → bot analizuje i doradza.
 **Plik:** `src/monitor_bot.py`
 **Kroki:**
@@ -82,7 +82,7 @@
 - Wywołaj `analyze_message(text=caption_or_none, media_paths=[tmp_path])`
 - Odpowiedz z kalkulatorem jeśli AI = PORTFOLIO_UPDATE
 
-### T10 ⬜ Odpowiadać na pytania tekstowe od Marcina w wolnej formie
+### T10 ✅ Odpowiadać na pytania tekstowe od Marcina w wolnej formie
 **Cel:** "Czy XTB wygląda teraz na kupno?" → bot odpowiada z kontekstem portfela.
 **Plik:** `src/monitor_bot.py`
 **Kroki:**
@@ -90,7 +90,7 @@
 - Systemowy prompt: "Jesteś doradcą GPW. Portfel tradera (IKE): {positions_ike}. Portfel tradera (IKZE): {positions_ikze}."
 - Limit: tylko gdy wiadomość > 10 znaków (żeby nie odpowiadać na emoji/ok/tak)
 
-### T11 ⬜ Analiza wiadomości wrzuconych bezpośrednio na recive-bot-investor
+### T11 ✅ Analiza wiadomości wrzuconych bezpośrednio na recive-bot-investor
 **Cel:** Forwarded/wklejony tekst od Marcina → AI analizuje jak z test-bot-inwestor.
 **Plik:** `src/monitor_bot.py`
 **Kroki:**
@@ -102,7 +102,7 @@
 
 ## FAZA 4 — Multi-provider AI fallback
 
-### T12 ⬜ Nowy plik src/ai_providers.py — abstrakcja dostawcy AI
+### T12 ✅ Nowy plik src/ai_providers.py — abstrakcja dostawcy AI
 **Cel:** Łatwa podmiana Gemini → Claude → OpenAI gdy jeden padnie.
 **Plik:** `src/ai_providers.py` (nowy)
 **Kroki:**
@@ -110,7 +110,7 @@
 - Każdy provider jako osobna async funkcja: `_call_gemini`, `_call_claude`, `_call_openai`
 - Łańcuch: Gemini 2.5-flash → Gemini 2.0-flash → Claude Haiku → GPT-4o-mini
 
-### T13 ⬜ Dodać Anthropic Claude jako fallback
+### T13 ✅ Dodać Anthropic Claude jako fallback
 **Plik:** `src/ai_providers.py`
 **Kroki:**
 - `pip install anthropic` + dodać do requirements.txt
@@ -118,7 +118,7 @@
 - Model: `claude-haiku-4-5-20251001` (najszybszy, najtańszy)
 - Dodać `ANTHROPIC_API_KEY=""` do `.env` i `config.py`
 
-### T14 ⬜ Dodać OpenAI GPT-4o-mini jako fallback
+### T14 ✅ Dodać OpenAI GPT-4o-mini jako fallback
 **Plik:** `src/ai_providers.py`
 **Kroki:**
 - `pip install openai` + dodać do requirements.txt
@@ -126,7 +126,7 @@
 - Model: `gpt-4o-mini`
 - Dodać `OPENAI_API_KEY=""` do `.env` i `config.py`
 
-### T15 ⬜ Zaktualizować parser.py — używać ai_providers
+### T15 ✅ Zaktualizować parser.py — używać ai_providers
 **Plik:** `src/parser.py`
 **Kroki:**
 - Zastąpić pętlę modeli Gemini wywołaniem `call_ai(prompt, images)`
@@ -137,7 +137,7 @@
 
 ## FAZA 5 — IKE/IKZE niezawodność
 
-### T16 ⬜ Content-based wykrycie IKE vs IKZE ze screenshota
+### T16 ✅ Content-based wykrycie IKE vs IKZE ze screenshota
 **Cel:** Damian używa różnych brokerów — layout inny, ale treść zawiera "IKE"/"IKZE".
 **Plik:** `src/parser.py` — dodać do CLASSIFY_PROMPT
 **Kroki:**
@@ -145,14 +145,14 @@
 - Instrukcja: "Sprawdź czy na screenie lub w tekście widać słowo IKE lub IKZE"
 - Jeśli wykryto → nadpisać `source_topic` w wyniku
 
-### T17 ⬜ Dodać kolumnę source_topic do ai_analyses w DB
+### T17 ✅ Dodać kolumnę source_topic do ai_analyses w DB
 **Plik:** `src/storage.py`
 **Kroki:**
 - Migracja: `ALTER TABLE ai_analyses ADD COLUMN source_topic TEXT`
 - (SQLite nie ma IF NOT EXISTS dla ALTER → obsłużyć OperationalError)
 - Przy `save_ai_analysis` zapisywać `ai_result.get("source_topic")`
 
-### T18 ⬜ Kontekst historyczny — ostatnie N wiadomości z tego samego konta
+### T18 ✅ Kontekst historyczny — ostatnie N wiadomości z tego samego konta
 **Cel:** AI widzi poprzednie sygnały z IKE gdy analizuje nowy sygnał IKE.
 **Plik:** `src/storage.py` + `src/parser.py`
 **Kroki:**
