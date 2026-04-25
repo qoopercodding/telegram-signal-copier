@@ -215,29 +215,34 @@ _AUTH_CODE_FILE = Path("/tmp/.damian_auth_code")
 _AUTH_REQUEST_FILE = Path("/tmp/.damian_auth_request")
 
 
-async def cmd_advisor_channel(event: events.NewMessage.Event) -> None:
+async def cmd_advisor_channel(event: events.NewMessage.Event, client: TelegramClient) -> None:
     """
     Nasłuchuje wiadomości na kanale recive-bot-investor.
     Reaguje na:
       - 5-cyfrowy kod SMS (gdy damian_watcher czeka na logowanie)
-      - '/advisor 120000'  (komenda)
-      - wolny tekst z kwotą PLN: 'mam 120k PLN wolnej gotówki'
+      - Zdjęcie od Marcina → AI analiza + rekomendacja
+      - '/advisor 120000' lub wolny tekst z kwotą PLN
+      - Pytania tekstowe → AI odpowiada z kontekstem portfela tradera
     """
     if event.message.out:
-        return  # Ignoruj własne wiadomości bota
+        return
 
-    text = (event.message.text or "").strip()
+    text = (event.message.text or event.message.caption or "").strip()
 
-    # Relay kodu SMS dla damian_watcher
-    # Akceptuje format z spacjami np. "4 8 4 2 7" lub bez "48427"
-    # Spacje zapobiegają auto-unieważnieniu kodu przez Telegram
+    # Relay kodu SMS
     stripped = re.sub(r"\s+", "", text)
     if re.match(r"^\d{5,6}$", stripped) and _AUTH_REQUEST_FILE.exists():
         _AUTH_CODE_FILE.write_text(stripped)
         logger.info(f"🔑 Kod SMS '{stripped}' przekazany do damian_watcher")
         return
-    cash: float | None = None
 
+    # Zdjęcie od Marcina → AI analiza
+    if event.message.photo or event.message.document:
+        await _handle_user_media(event, client, text or None)
+        return
+
+    # /advisor lub kwota PLN
+    cash: float | None = None
     if text.lower().startswith("/advisor"):
         parts = text.split(None, 1)
         if len(parts) == 2:
@@ -251,16 +256,119 @@ async def cmd_advisor_channel(event: events.NewMessage.Event) -> None:
             return
     else:
         cash = parse_cash_amount(text)
-        if not cash:
-            return
 
-    logger.info(f"💡 Advisor: {cash:,.0f} PLN (chat={event.chat_id})")
+    if cash:
+        logger.info(f"💡 Advisor: {cash:,.0f} PLN (chat={event.chat_id})")
+        try:
+            reply = await build_advisor_message(cash)
+            await event.reply(reply, parse_mode="markdown")
+        except Exception as exc:
+            logger.error(f"Advisor błąd: {exc}")
+            await event.reply(f"❌ Błąd kalkulatora: {exc}")
+        return
+
+    # Pytanie tekstowe (min. 10 znaków, nie komenda)
+    if len(text) >= 10 and not text.startswith("/"):
+        await _handle_user_question(event, text)
+
+
+async def _handle_user_media(
+    event: events.NewMessage.Event,
+    client: TelegramClient,
+    caption: str | None,
+) -> None:
+    """Pobiera zdjęcie od Marcina, analizuje AI i odpowiada rekomendacją."""
+    from src.parser import analyze_message
+    from src.storage import get_latest_trader_positions
+
+    tmp_path = MEDIA_DIR / f"user_input_{event.message.id}.jpg"
     try:
-        reply = await build_advisor_message(cash)
-        await event.reply(reply, parse_mode="markdown")
-    except Exception as exc:
-        logger.error(f"Advisor błąd: {exc}")
-        await event.reply(f"❌ Błąd kalkulatora: {exc}")
+        await client.download_media(event.message, file=str(tmp_path))
+        logger.info(f"📷 Pobrano zdjęcie od Marcina: {tmp_path.name}")
+    except Exception as e:
+        logger.error(f"Błąd pobierania zdjęcia: {e}")
+        await event.reply("❌ Nie mogłem pobrać zdjęcia")
+        return
+
+    await event.reply("🤔 Analizuję...")
+
+    try:
+        ai = await analyze_message(text=caption, media_paths=[str(tmp_path)])
+        msg_type = ai.get("message_type")
+        confidence = ai.get("confidence", 0.0)
+        summary = ai.get("summary", "")
+
+        lines = [f"🔍 *Analiza Twojego zdjęcia* (pewność: {confidence*100:.0f}%)", "", f"_{summary}_", ""]
+
+        if msg_type == "PORTFOLIO_UPDATE":
+            positions = ai.get("portfolio_positions") or []
+            if positions:
+                lines.append("📊 *Wykryte pozycje:*")
+                for p in positions:
+                    pct = p.get("percentage") or 0
+                    lines.append(f"• {p['ticker']} — {pct:.1f}%")
+                lines += ["", "💡 _Napisz ile masz PLN do zainwestowania, a obliczę ile sztuk kupić._"]
+            else:
+                lines.append("Nie rozpoznałem konkretnych pozycji na tym screenshocie.")
+
+        elif msg_type == "TRADE_ACTION":
+            ts = ai.get("trade_signal") or {}
+            action = ts.get("action", "?")
+            ticker = ts.get("ticker", "?")
+            lines.append(f"📈 Widzę akcję: *{action} {ticker}*")
+            lines.append("Chcesz żebym to wykonał? (AKCEPTUJ/ODRZUĆ)")
+
+        elif msg_type in ("INFORMATIONAL", "COMMENT"):
+            trader_pos = get_latest_trader_positions()
+            if trader_pos:
+                tickers = ", ".join(p["ticker"] for p in trader_pos[:5])
+                lines.append(f"ℹ️ Komentarz rynkowy. Aktualny portfel tradera: {tickers}...")
+            else:
+                lines.append("ℹ️ Komentarz rynkowy — brak sygnału tradingowego.")
+
+        else:
+            lines.append(f"ℹ️ Typ wiadomości: {msg_type}")
+
+        await event.reply("\n".join(lines), parse_mode="markdown")
+
+    except Exception as e:
+        logger.error(f"Błąd analizy zdjęcia od Marcina: {e}")
+        await event.reply(f"❌ Błąd analizy: {e}")
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+
+async def _handle_user_question(event: events.NewMessage.Event, text: str) -> None:
+    """Odpowiada na pytania tekstowe Marcina z kontekstem portfela tradera."""
+    from src.parser import get_client as get_ai_client
+    from src.storage import get_latest_trader_positions
+    from google.genai import types as gtypes
+
+    positions = get_latest_trader_positions()
+    if positions:
+        pos_str = ", ".join(f"{p['ticker']} {p.get('percentage',0):.0f}%" for p in positions)
+        context = f"Portfel tradera: {pos_str}"
+    else:
+        context = "Brak danych o portfelu tradera w bazie."
+
+    prompt = (
+        f"Jesteś doradcą inwestycyjnym dla polskiej giełdy GPW. "
+        f"{context}\n\n"
+        f"Pytanie inwestora: {text}\n\n"
+        f"Odpowiedz krótko i konkretnie po polsku (max 3 zdania)."
+    )
+
+    try:
+        ai_client = get_ai_client()
+        response = await ai_client.aio.models.generate_content(
+            model="gemini-2.0-flash",
+            contents=[gtypes.Part.from_text(text=prompt)],
+        )
+        answer = (response.text or "").strip()
+        if answer:
+            await event.reply(f"💬 {answer}", parse_mode="markdown")
+    except Exception as e:
+        logger.error(f"Błąd odpowiedzi na pytanie: {e}")
 
 
 # ============================================================
@@ -592,11 +700,11 @@ async def main() -> None:
     async def _callback(event):
         await cmd_callback(event)
 
-    # Nasłuch wiadomości na kanale recive-bot-investor (advisor)
+    # Nasłuch wiadomości na kanale recive-bot-investor (advisor + zdjęcia + pytania)
     if settings.raw_channel_id:
         @client.on(events.NewMessage(chats=settings.raw_channel_id))
         async def _channel_msg(event):
-            await cmd_advisor_channel(event)
+            await cmd_advisor_channel(event, client)
         logger.info(f"📡 Nasłuchuję kanał {settings.raw_channel_id} (advisor)")
 
     await client.start(bot_token=settings.bot_token)
