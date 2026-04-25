@@ -211,6 +211,7 @@ async def handle_new_message(event: events.NewMessage.Event, client: TelegramCli
 # ============================================================
 
 HEARTBEAT_FILE = LOGS_DIR.parent / ".heartbeat"
+FETCH_REQUEST_FILE = Path("/tmp/.fetch_request.json")
 
 _last_message_at: str = "brak"
 _start_time = None
@@ -239,6 +240,60 @@ def write_heartbeat() -> None:
         "messages_total": count_messages(),
     }
     HEARTBEAT_FILE.write_text(json.dumps(data))
+
+
+async def fetch_request_loop(client: TelegramClient, process_fn) -> None:
+    """
+    Co 5 sekund sprawdza plik /tmp/.fetch_request.json zostawiony przez monitor_bot.
+    Gdy znajdzie — pobiera wiadomości z Damiana i wywołuje process_fn dla każdej.
+    """
+    import json
+    import time as _time
+    from src.damian_watcher import TOPIC_NAMES
+
+    while True:
+        await asyncio.sleep(5)
+        if not FETCH_REQUEST_FILE.exists():
+            continue
+        try:
+            req = json.loads(FETCH_REQUEST_FILE.read_text())
+            FETCH_REQUEST_FILE.unlink(missing_ok=True)
+
+            topic_id = req.get("topic_id")
+            count = int(req.get("count", 5))
+            req_ts = req.get("ts", 0)
+
+            if _time.time() - req_ts > 120:
+                logger.warning("fetch_request zbyt stary (>120s) — pomijam")
+                continue
+            if not topic_id:
+                continue
+
+            topic_name = TOPIC_NAMES.get(topic_id, str(topic_id))
+            logger.info(f"📋 fetch_request_loop: {topic_name} x{count}")
+
+            msgs = []
+            async for m in client.iter_messages(
+                entity=settings.damian_group_id,
+                reply_to=topic_id,
+                limit=count,
+            ):
+                msgs.append(m)
+
+            if not msgs:
+                logger.warning(f"Brak wiadomości w [{topic_name}]")
+                continue
+
+            msgs.reverse()
+            for m in msgs:
+                await process_fn(m, topic_name)
+                await asyncio.sleep(0.3)
+
+            logger.info(f"✅ fetch_request_loop: {topic_name} — przetworzono {len(msgs)} wiadomości")
+
+        except Exception as e:
+            logger.error(f"fetch_request_loop error: {e}")
+            FETCH_REQUEST_FILE.unlink(missing_ok=True)
 
 
 async def heartbeat_loop() -> None:
@@ -288,17 +343,7 @@ async def main() -> None:
     if settings.damian_group_id:
         from src.damian_watcher import (
             is_watched_topic, get_topic_id, TOPIC_NAMES,
-            parse_fetch_command, fetch_and_forward,
         )
-        async def _bot_reply(text: str) -> None:
-            """Wysyła wiadomość na recive-bot-investor przez MTProto (userbot)."""
-            if not settings.raw_channel_id:
-                return
-            try:
-                await client.send_message(settings.raw_channel_id, text, parse_mode="md")
-            except Exception as e:
-                logger.error(f"_bot_reply error: {e}")
-
         async def _process_damian_msg(msg: Message, topic_name: str) -> None:
             """Pobiera media i analizuje wiadomość z grupy Damiana przez AI."""
             # Zapisz surową wiadomość — blokuje duplikaty przy wielokrotnym /fetch
@@ -355,49 +400,8 @@ async def main() -> None:
             logger.info(f"📩 Damian [{topic_name}] nowa wiadomość id={msg.id}")
             await _process_damian_msg(msg, topic_name)
 
-        @client.on(events.NewMessage(chats=settings.raw_channel_id))
-        async def _fetch_handler(event: events.NewMessage.Event) -> None:
-            text = (event.message.text or "").strip()
-            topic_id, count = parse_fetch_command(text)
-            if not topic_id:
-                return
-
-            topic_name = TOPIC_NAMES[topic_id]
-            logger.info(f"📋 /fetch [{topic_name}] x{count} — zaczynam")
-            await _bot_reply(f"⏳ Pobieram i analizuję *{count}* wiadomości z *{topic_name}*...")
-
-            try:
-                msgs: list[Message] = []
-                async for m in client.iter_messages(
-                    entity=settings.damian_group_id,
-                    reply_to=topic_id,
-                    limit=count,
-                ):
-                    msgs.append(m)
-
-                if not msgs:
-                    await _bot_reply(
-                        f"⚠️ Brak wiadomości w *{topic_name}*\n"
-                        f"_Sprawdź czy konto ma dostęp do grupy Damiana "
-                        f"(topic ID: {topic_id})._"
-                    )
-                    return
-
-                msgs.reverse()
-                for m in msgs:
-                    await _process_damian_msg(m, topic_name)
-                    await asyncio.sleep(0.3)
-
-                await _bot_reply(
-                    f"✅ Przeanalizowano *{len(msgs)}* wiadomości z *{topic_name}*\n"
-                    f"_Powiadomienia o sygnałach pojawiły się powyżej._"
-                )
-            except Exception as e:
-                logger.error(f"❌ /fetch [{topic_name}] błąd: {e}")
-                await _bot_reply(f"❌ Błąd pobierania z *{topic_name}*:\n`{e}`")
-
         logger.info(f"   Damian:    {settings.damian_group_id} (IKE:{settings.damian_ike_topic_id} IKZE:{settings.damian_ikze_topic_id})")
-        logger.info(f"   /fetch:    nasłuchuję na {settings.raw_channel_id}")
+        logger.info(f"   /fetch:    polling {FETCH_REQUEST_FILE} co 5s")
 
     async with client:
         me = await client.get_me()
@@ -407,8 +411,10 @@ async def main() -> None:
         # Pierwszy heartbeat
         write_heartbeat()
 
-        # Uruchom heartbeat w tle
+        # Uruchom pętle w tle
         asyncio.create_task(heartbeat_loop())
+        if settings.damian_group_id:
+            asyncio.create_task(fetch_request_loop(client, _process_damian_msg))
 
         await client.run_until_disconnected()
 

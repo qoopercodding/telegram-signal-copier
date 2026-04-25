@@ -213,21 +213,46 @@ async def build_advisor_message(cash_pln: float) -> str:
 
 _AUTH_CODE_FILE = Path("/tmp/.damian_auth_code")
 _AUTH_REQUEST_FILE = Path("/tmp/.damian_auth_request")
+FETCH_REQUEST_FILE = Path("/tmp/.fetch_request.json")
 
 
 async def cmd_advisor_channel(event: events.NewMessage.Event, client: TelegramClient) -> None:
     """
     Nasłuchuje wiadomości na kanale recive-bot-investor.
     Reaguje na:
+      - /fetch IKE N / /fetch IKZE N → trigger fetchowania w signal-copier przez plik
       - 5-cyfrowy kod SMS (gdy damian_watcher czeka na logowanie)
       - Zdjęcie od Marcina → AI analiza + rekomendacja
       - '/advisor 120000' lub wolny tekst z kwotą PLN
       - Pytania tekstowe → AI odpowiada z kontekstem portfela tradera
     """
+    # Ignoruj wiadomości od botów i wychodzące (własne)
     if event.message.out:
+        return
+    sender = await event.get_sender()
+    if sender and getattr(sender, "bot", False):
         return
 
     text = (event.message.text or event.message.caption or "").strip()
+    if not text:
+        return
+
+    # /fetch IKE N — przekaż do signal-copier przez plik
+    if text.lower().startswith("/fetch"):
+        from src.damian_watcher import parse_fetch_command, TOPIC_NAMES
+        import json, time as _time
+        topic_id, count = parse_fetch_command(text)
+        if topic_id:
+            req = {"topic_id": topic_id, "count": count, "ts": _time.time()}
+            FETCH_REQUEST_FILE.write_text(json.dumps(req))
+            logger.info(f"📋 /fetch request zapisany: {TOPIC_NAMES.get(topic_id)} x{count}")
+            await event.respond(
+                f"⏳ Pobieram i analizuję <b>{count}</b> wiadomości z <b>{TOPIC_NAMES.get(topic_id)}</b>...",
+                parse_mode="html",
+            )
+        else:
+            await event.respond("Użycie: <code>/fetch IKE 5</code> lub <code>/fetch IKZE 10</code>", parse_mode="html")
+        return
 
     # Relay kodu SMS
     stripped = re.sub(r"\s+", "", text)
@@ -252,7 +277,7 @@ async def cmd_advisor_channel(event: events.NewMessage.Event, client: TelegramCl
             except ValueError:
                 pass
         if not cash:
-            await event.reply("Użycie: `/advisor 120000` lub napisz np. `mam 120k PLN`")
+            await event.respond("Użycie: <code>/advisor 120000</code> lub napisz np. <code>mam 120k PLN</code>", parse_mode="html")
             return
     else:
         cash = parse_cash_amount(text)
@@ -261,10 +286,10 @@ async def cmd_advisor_channel(event: events.NewMessage.Event, client: TelegramCl
         logger.info(f"💡 Advisor: {cash:,.0f} PLN (chat={event.chat_id})")
         try:
             reply = await build_advisor_message(cash)
-            await event.reply(reply, parse_mode="markdown")
+            await event.respond(reply, parse_mode="markdown")
         except Exception as exc:
             logger.error(f"Advisor błąd: {exc}")
-            await event.reply(f"❌ Błąd kalkulatora: {exc}")
+            await event.respond(f"❌ Błąd kalkulatora: {exc}")
         return
 
     # Pytanie tekstowe (min. 10 znaków, nie komenda)
@@ -361,7 +386,7 @@ async def _handle_user_question(event: events.NewMessage.Event, text: str) -> No
     try:
         ai_client = get_ai_client()
         response = await ai_client.aio.models.generate_content(
-            model="gemini-2.0-flash",
+            model="gemini-2.5-flash",
             contents=[gtypes.Part.from_text(text=prompt)],
         )
         answer = (response.text or "").strip()
