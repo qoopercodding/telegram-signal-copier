@@ -86,6 +86,7 @@ FETCH_REQUEST_FILE = Path("/tmp/.fetch_request.json")
 _last_message_at: str = "brak"
 _start_time: float | None = None
 _damian_topic_map: dict[int, str] = {}   # forwarded_msg_id → "IKE" / "IKZE"
+_bot_sent_ids: set[int] = set()          # IDs wiadomości wysłanych przez bota → pomijaj w handlerach
 
 
 def write_heartbeat() -> None:
@@ -165,7 +166,7 @@ async def _process_message(msg: Message, chat_id: int, client: TelegramClient) -
         logger.info(f"🤖 AI: {msg_type} | confidence={confidence:.2f} | {ai_result.get('summary','?')[:80]}")
 
         if msg_type in ("TRADE_ACTION", "PORTFOLIO_UPDATE", "INFORMATIONAL") and confidence >= 0.6:
-            await send_signal_notification(msg.id, ai_result, media_paths, client)
+            await send_signal_notification(msg.id, ai_result, media_paths, client, _track_ids=_bot_sent_ids)
         else:
             logger.debug(f"ℹ️ Bez powiadomienia: type={msg_type}, confidence={confidence:.2f}")
 
@@ -307,8 +308,16 @@ async def _answer_question(text: str, client: TelegramClient) -> str:
     return (response.text or "").strip()
 
 
+async def _send_to_raw(client: TelegramClient, text: str, **kwargs) -> None:
+    """Wysyła do raw_channel_id i rejestruje ID aby uniknąć pętli odpowiedzi."""
+    sent = await client.send_message(settings.raw_channel_id, text, **kwargs)
+    _bot_sent_ids.add(sent.id)
+    if len(_bot_sent_ids) > 300:
+        _bot_sent_ids.discard(min(_bot_sent_ids))
+
+
 async def handle_channel_message(
-    event: events.NewMessage.Event,
+    msg: Message,
     client: TelegramClient,
     forward_fn,
 ) -> None:
@@ -316,8 +325,7 @@ async def handle_channel_message(
     Handler dla wiadomości od Marcina na recive-bot-investor.
     Obsługuje: /fetch, kwoty PLN (advisor), pytania AI, zdjęcia.
     """
-    msg: Message = event.message
-    if msg.out:
+    if msg.id in _bot_sent_ids:
         return
 
     text = (msg.text or "").strip()
@@ -329,11 +337,11 @@ async def handle_channel_message(
             await asyncio.wait_for(client.download_media(msg, file=str(tmp_path)), timeout=30)
         except Exception as e:
             logger.error(f"Błąd pobierania zdjęcia od Marcina: {e}")
-            await client.send_message(settings.raw_channel_id, "❌ Nie mogłem pobrać zdjęcia")
+            await _send_to_raw(client, "❌ Nie mogłem pobrać zdjęcia")
             return
 
         logger.info(f"📷 Zdjęcie od Marcina: {tmp_path.name}")
-        await client.send_message(settings.raw_channel_id, "🤔 Analizuję...")
+        await _send_to_raw(client, "🤔 Analizuję...")
         try:
             ai = await asyncio.wait_for(
                 analyze_message(text=text or None, media_paths=[str(tmp_path)]),
@@ -362,12 +370,12 @@ async def handle_channel_message(
                 else:
                     lines.append("ℹ️ Komentarz rynkowy — brak sygnału tradingowego.")
 
-            await client.send_message(settings.raw_channel_id, "\n".join(lines), parse_mode="markdown")
+            await _send_to_raw(client, "\n".join(lines), parse_mode="markdown")
         except asyncio.TimeoutError:
-            await client.send_message(settings.raw_channel_id, "❌ Timeout analizy AI (>90s)")
+            await _send_to_raw(client, "❌ Timeout analizy AI (>90s)")
         except Exception as e:
             logger.error(f"Błąd analizy zdjęcia: {e}")
-            await client.send_message(settings.raw_channel_id, f"❌ Błąd analizy: {e}")
+            await _send_to_raw(client, f"❌ Błąd analizy: {e}")
         finally:
             tmp_path.unlink(missing_ok=True)
         return
@@ -380,17 +388,17 @@ async def handle_channel_message(
         from src.damian_watcher import parse_fetch_command, TOPIC_NAMES
         topic_id, count = parse_fetch_command(text)
         if not topic_id:
-            await client.send_message(settings.raw_channel_id,
+            await _send_to_raw(client,
                 "Użycie: `/fetch IKE 5` lub `/fetch IKZE 10`", parse_mode="markdown")
             return
         topic_name = TOPIC_NAMES.get(topic_id, str(topic_id))
-        await client.send_message(settings.raw_channel_id,
+        await _send_to_raw(client,
             f"⏳ Pobieram *{count}* wiadomości z *{topic_name}*...", parse_mode="markdown")
         msgs_fetched = []
         async for m in client.iter_messages(entity=settings.damian_group_id, reply_to=topic_id, limit=count):
             msgs_fetched.append(m)
         if not msgs_fetched:
-            await client.send_message(settings.raw_channel_id, f"⚠️ Brak wiadomości w {topic_name}")
+            await _send_to_raw(client, f"⚠️ Brak wiadomości w {topic_name}")
             return
         msgs_fetched.reverse()
         for m in msgs_fetched:
@@ -405,12 +413,12 @@ async def handle_channel_message(
         logger.info(f"💡 Advisor: {cash:,.0f} PLN")
         try:
             reply = await asyncio.wait_for(build_advisor_message(cash), timeout=30)
-            await client.send_message(settings.raw_channel_id, reply, parse_mode="markdown")
+            await _send_to_raw(client, reply, parse_mode="markdown")
         except asyncio.TimeoutError:
-            await client.send_message(settings.raw_channel_id, "❌ Timeout pobierania kursów")
+            await _send_to_raw(client, "❌ Timeout pobierania kursów")
         except Exception as e:
             logger.error(f"Advisor błąd: {e}")
-            await client.send_message(settings.raw_channel_id, f"❌ Błąd kalkulatora: {e}")
+            await _send_to_raw(client, f"❌ Błąd kalkulatora: {e}")
         return
 
     # Pytanie tekstowe → AI
@@ -419,9 +427,9 @@ async def handle_channel_message(
         try:
             answer = await _answer_question(text, client)
             if answer:
-                await client.send_message(settings.raw_channel_id, f"💬 {answer}", parse_mode="markdown")
+                await _send_to_raw(client, f"💬 {answer}", parse_mode="markdown")
         except asyncio.TimeoutError:
-            await client.send_message(settings.raw_channel_id, "❌ Timeout AI (>60s)")
+            await _send_to_raw(client, "❌ Timeout AI (>60s)")
         except Exception as e:
             logger.error(f"Błąd odpowiedzi AI: {e}")
 
@@ -503,7 +511,7 @@ async def main() -> None:
             _last_message_at = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
             try:
                 await asyncio.wait_for(
-                    handle_channel_message(event, client, _forward_to_staging),
+                    handle_channel_message(event.message, client, _forward_to_staging),
                     timeout=120,
                 )
             except asyncio.TimeoutError:
@@ -555,6 +563,44 @@ async def main() -> None:
                         logger.error(f"Staging poll error: {e}")
 
             asyncio.create_task(_staging_poll_loop())
+
+        if settings.raw_channel_id:
+            # Polling fallback dla recive-bot-investor (Marcin pisze na kanale)
+            async def _output_poll_loop():
+                last_id = 0
+                try:
+                    seed = await client.get_messages(settings.raw_channel_id, limit=1)
+                    if seed:
+                        last_id = seed[0].id
+                        logger.info(f"🔄 Output poll init: last_id={last_id}")
+                except Exception as e:
+                    logger.warning(f"Output poll init error: {e}")
+
+                while True:
+                    await asyncio.sleep(15)
+                    try:
+                        new_msgs = await client.get_messages(
+                            settings.raw_channel_id, min_id=last_id, limit=20
+                        )
+                        for msg in reversed(new_msgs):
+                            if msg.id > last_id:
+                                last_id = msg.id
+                                if msg.id in _bot_sent_ids:
+                                    continue
+                                logger.info(f"🔄 Output poll: wiadomość Marcina id={msg.id}: {repr((msg.text or '')[:40])}")
+                                try:
+                                    await asyncio.wait_for(
+                                        handle_channel_message(msg, client, _forward_to_staging),
+                                        timeout=120,
+                                    )
+                                except asyncio.TimeoutError:
+                                    logger.error(f"Output poll timeout msg {msg.id}")
+                                except Exception as e:
+                                    logger.error(f"Output poll handler error: {e}")
+                    except Exception as e:
+                        logger.error(f"Output poll error: {e}")
+
+            asyncio.create_task(_output_poll_loop())
 
         if settings.damian_group_id:
             # Fallback /fetch przez IPC (monitor_bot nadal może pisać plik)

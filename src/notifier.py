@@ -161,6 +161,7 @@ async def send_signal_notification(
     ai_result: dict,
     media_paths: list[str] = None,
     client=None,
+    _track_ids: set | None = None,
 ) -> bool:
     """
     Wysyła powiadomienie przez Telethon (MTProto) do RAW_CHANNEL_ID.
@@ -218,6 +219,8 @@ async def send_signal_notification(
             else:
                 # Wyślij zdjęcie bez podpisu, potem tekst osobno
                 photo_msg = await client.send_file(chat_id, photo_path)
+                if _track_ids is not None:
+                    _track_ids.add(photo_msg.id)
                 sent_msg = await client.send_message(
                     chat_id, text, parse_mode="html", reply_to=photo_msg.id
                 )
@@ -226,6 +229,9 @@ async def send_signal_notification(
             sent_msg = await client.send_message(chat_id, text, parse_mode="html")
             sent_id = sent_msg.id
 
+        if _track_ids is not None:
+            _track_ids.add(sent_id)
+
         logger.info(f"📨 Powiadomienie wysłane → chat={chat_id} msg_id={msg_id} sent={sent_id}")
 
         # Dla PORTFOLIO_UPDATE: osobna wiadomość z ilościami sztuk
@@ -233,7 +239,9 @@ async def send_signal_notification(
             positions = ai_result.get("portfolio_positions") or []
             if positions:
                 buy_list = await _build_buy_list(positions, settings.my_portfolio_size)
-                await client.send_message(chat_id, buy_list, parse_mode="html", reply_to=sent_id)
+                buy_msg = await client.send_message(chat_id, buy_list, parse_mode="html", reply_to=sent_id)
+                if _track_ids is not None:
+                    _track_ids.add(buy_msg.id)
                 logger.info(f"📈 Buy list wysłany ({len(positions)} pozycji)")
             else:
                 logger.debug("Brak portfolio_positions — pomijam buy list")
