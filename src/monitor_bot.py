@@ -41,6 +41,8 @@ MEDIA_RETENTION_DAYS = 30
 DB_SIZE_ALERT_MB = 500
 START_TIME = time.time()
 
+_last_activity_at: float = time.time()  # watchdog tracking
+
 
 # ============================================================
 # Helpers
@@ -717,6 +719,16 @@ async def heartbeat_checker(client: TelegramClient) -> None:
                     logger.error(f"Błąd wysyłania alertu heartbeat: {e}")
 
 
+async def _watchdog() -> None:
+    """Zabija proces gdy event loop jest zamrożony > 10 minut. systemd go zrestartuje."""
+    while True:
+        await asyncio.sleep(60)
+        frozen_for = time.time() - _last_activity_at
+        if frozen_for > 600:  # 10 minut bez aktywności
+            logger.error(f"🚨 Watchdog: bot zamrożony {int(frozen_for)}s — restartuję")
+            os._exit(1)
+
+
 # ============================================================
 # Main
 # ============================================================
@@ -768,13 +780,20 @@ async def main() -> None:
     if settings.raw_channel_id:
         @client.on(events.NewMessage(chats=settings.raw_channel_id))
         async def _channel_msg(event):
-            await cmd_advisor_channel(event, client)
+            global _last_activity_at
+            _last_activity_at = time.time()
+            try:
+                await asyncio.wait_for(cmd_advisor_channel(event, client), timeout=90)
+            except asyncio.TimeoutError:
+                logger.error("cmd_advisor_channel timeout (90s) — event porzucony")
         logger.info(f"📡 Nasłuchuję kanał {settings.raw_channel_id} (advisor)")
 
     # Nasłuch wiadomości na kanale test-bot-inwestor (staging → IPC → signal-copier AI)
     if settings.source_group_id:
         @client.on(events.NewMessage(chats=settings.source_group_id))
         async def _staging_msg(event):
+            global _last_activity_at
+            _last_activity_at = time.time()
             msg = event.message
             if msg.out:
                 return
@@ -787,8 +806,9 @@ async def main() -> None:
     me = await client.get_me()
     logger.info(f"✅ Monitor Bot zalogowany: @{me.username}")
 
-    # Uruchom heartbeat checker w tle
+    # Uruchom heartbeat checker i watchdog w tle
     asyncio.create_task(heartbeat_checker(client))
+    asyncio.create_task(_watchdog())
 
     logger.info("👂 Czekam na komendy...")
     await client.run_until_disconnected()
