@@ -367,31 +367,63 @@ async def _handle_user_media(
 
 
 async def _handle_user_question(event: events.NewMessage.Event, text: str) -> None:
-    """Odpowiada na pytania tekstowe Marcina z kontekstem portfela tradera."""
+    """Odpowiada na pytania tekstowe Marcina z kontekstem portfela i logów."""
     from src.parser import get_client as get_ai_client
     from src.storage import get_latest_trader_positions
     from google.genai import types as gtypes
 
+    AI_MODEL = "gemini-2.5-flash"
+
+    # Kontekst: pozycje portfela tradera
     positions = get_latest_trader_positions()
     if positions:
-        pos_str = ", ".join(
-            f"{p['ticker']} {(p.get('percentage') or 0):.0f}%" for p in positions
-        )
-        context = f"Portfel tradera: {pos_str}"
+        pos_lines = []
+        for p in positions:
+            pct = p.get("percentage") or 0
+            val = p.get("value_pln")
+            pos_lines.append(
+                f"  {p['ticker']}: {pct:.1f}%" + (f", {val:,.0f} PLN" if val else "")
+            )
+        portfolio_ctx = "Ostatnie pozycje portfela tradera w DB:\n" + "\n".join(pos_lines)
     else:
-        context = "Brak danych o portfelu tradera w bazie."
+        portfolio_ctx = "Brak danych o portfelu tradera w bazie SQLite."
 
-    prompt = (
-        f"Jesteś doradcą inwestycyjnym dla polskiej giełdy GPW. "
-        f"{context}\n\n"
-        f"Pytanie inwestora: {text}\n\n"
-        f"Odpowiedz krótko i konkretnie po polsku (max 3 zdania)."
-    )
+    # Kontekst: ostatnie logi (15 linii)
+    log_ctx = ""
+    log_files = sorted(LOGS_DIR.glob("listener_*.log"), reverse=True)
+    if log_files:
+        try:
+            lines = log_files[0].read_text(encoding="utf-8").strip().split("\n")
+            log_ctx = "Ostatnie logi signal-copier (listener):\n" + "\n".join(lines[-15:])
+        except Exception:
+            pass
+
+    prompt = f"""Jesteś asystentem Marcina — właściciela systemu do śledzenia sygnałów giełdowych GPW.
+
+KIM JESTEŚ (odpowiedz szczerze gdy ktoś pyta):
+- Jesteś modelem {AI_MODEL} (Google Gemini)
+- NIE jesteś brokerem, doradcą finansowym ani systemem tradingowym
+- Jesteś papugą lingwistyczną z dostępem do danych z bazy SQLite i logów procesu
+- Twoje obliczenia to arytmetyka na danych z DB — nie prognozujesz, nie masz kryształowej kuli
+- Gdy pytają "jakim modelem jesteś" — powiedz wprost: {AI_MODEL}
+
+DANE KONTEKSTOWE:
+{portfolio_ctx}
+
+{log_ctx}
+
+ZASADY:
+- Odpowiadaj krótko i konkretnie po polsku (max 4 zdania)
+- Nie udawaj eksperta — mów co widzisz w danych, nie więcej
+- Jeśli pytanie dotyczy logów — przytoczyć fragment z powyższego kontekstu
+- Jeśli pytasz o coś czego nie ma w danych — powiedz że nie wiesz
+
+PYTANIE MARCINA: {text}"""
 
     try:
         ai_client = get_ai_client()
         response = await ai_client.aio.models.generate_content(
-            model="gemini-2.5-flash",
+            model=AI_MODEL,
             contents=[gtypes.Part.from_text(text=prompt)],
         )
         answer = (response.text or "").strip()
