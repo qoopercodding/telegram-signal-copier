@@ -133,9 +133,6 @@ async def handle_new_message(event: events.NewMessage.Event, client: TelegramCli
     source_id = settings.source_group_id
     if source_id != 0 and event.chat_id != source_id:
         return  # Ignoruj wiadomości z innych czatów
-    # Jeśli SOURCE == DAMIAN_GROUP — _damian_handler obsługuje sam, nie dubluj
-    if settings.damian_group_id and event.chat_id == settings.damian_group_id:
-        return
 
     logger.info(
         f"📨 Nowa wiadomość | id={msg.id} | chat={event.chat_id} | "
@@ -338,15 +335,14 @@ async def main() -> None:
         _last_message_at = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
         await handle_new_message(event, client)
 
-    # Handler 2 — wiadomości z prywatnej grupy Damiana (IKE/IKZE → forward live)
-    # Handler 3 — komendy /fetch z kanału recive-bot-investor
+    # Handler 2 — wiadomości z prywatnej grupy Damiana (IKE/IKZE → forward do test-bot-inwestor)
     if settings.damian_group_id:
         from src.damian_watcher import (
             is_watched_topic, get_topic_id, TOPIC_NAMES,
         )
-        async def _process_damian_msg(msg: Message, topic_name: str) -> None:
-            """Pobiera media i analizuje wiadomość z grupy Damiana przez AI."""
-            # Zapisz surową wiadomość — blokuje duplikaty przy wielokrotnym /fetch
+
+        async def _forward_to_staging(msg: Message, topic_name: str) -> None:
+            """Forwarduje wiadomość Damiana do SOURCE_GROUP_ID (test-bot-inwestor)."""
             saved = save_raw_message(
                 message_id=msg.id,
                 chat_id=settings.damian_group_id,
@@ -357,39 +353,20 @@ async def main() -> None:
                 grouped_id=msg.grouped_id,
             )
             if not saved:
-                logger.debug(f"[{topic_name}] Duplikat msg {msg.id} — pomijam AI")
+                logger.debug(f"[{topic_name}] Duplikat msg {msg.id} — pomijam forward")
                 return
 
-            media_paths = await download_media(msg, client)
-            if media_paths:
-                update_media_paths(msg.id, settings.damian_group_id, media_paths)
-
-            if not settings.gemini_api_key:
-                return
             try:
-                ai_result = await analyze_message(
-                    text=msg.text or None,
-                    media_paths=media_paths or None,
-                    source_topic=topic_name,
+                fwd = await client.forward_messages(
+                    entity=settings.source_group_id,
+                    messages=msg.id,
+                    from_peer=settings.damian_group_id,
                 )
-                ai_result["source_topic"] = topic_name
-                save_ai_analysis(msg.id, settings.damian_group_id, ai_result)
-
-                if ai_result.get("message_type") == "PORTFOLIO_UPDATE":
-                    positions = ai_result.get("portfolio_positions")
-                    if positions:
-                        save_trader_positions(msg.id, positions)
-
-                msg_type   = ai_result.get("message_type")
-                confidence = ai_result.get("confidence", 0.0)
-                logger.info(
-                    f"🤖 [{topic_name}] AI: {msg_type} | "
-                    f"confidence={confidence:.2f} | {ai_result.get('summary','?')[:80]}"
-                )
-                if msg_type in ("TRADE_ACTION", "PORTFOLIO_UPDATE", "INFORMATIONAL") and confidence >= 0.6:
-                    await send_signal_notification(msg.id, ai_result, media_paths, client)
+                fwd_id = fwd[0].id if isinstance(fwd, list) else fwd.id
+                _damian_topic_map[fwd_id] = topic_name
+                logger.info(f"📤 [{topic_name}] Forwarded Damian msg {msg.id} → staging {fwd_id}")
             except Exception as e:
-                logger.error(f"❌ AI analiza Damian [{topic_name}] msg {msg.id}: {e}")
+                logger.error(f"❌ Forward [{topic_name}] msg {msg.id}: {e}")
 
         @client.on(events.NewMessage(chats=settings.damian_group_id))
         async def _damian_handler(event: events.NewMessage.Event) -> None:
@@ -398,9 +375,10 @@ async def main() -> None:
                 return
             topic_name = TOPIC_NAMES.get(get_topic_id(msg), "?")
             logger.info(f"📩 Damian [{topic_name}] nowa wiadomość id={msg.id}")
-            await _process_damian_msg(msg, topic_name)
+            await _forward_to_staging(msg, topic_name)
 
         logger.info(f"   Damian:    {settings.damian_group_id} (IKE:{settings.damian_ike_topic_id} IKZE:{settings.damian_ikze_topic_id})")
+        logger.info(f"   Staging:   {settings.source_group_id} (test-bot-inwestor)")
         logger.info(f"   /fetch:    polling {FETCH_REQUEST_FILE} co 5s")
 
     async with client:
@@ -414,7 +392,7 @@ async def main() -> None:
         # Uruchom pętle w tle
         asyncio.create_task(heartbeat_loop())
         if settings.damian_group_id:
-            asyncio.create_task(fetch_request_loop(client, _process_damian_msg))
+            asyncio.create_task(fetch_request_loop(client, _forward_to_staging))
 
         await client.run_until_disconnected()
 
