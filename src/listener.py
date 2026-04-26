@@ -122,85 +122,80 @@ async def download_media(msg: Message, client: TelegramClient) -> list[str]:
 # Handler nowych wiadomości
 # ============================================================
 
-async def handle_new_message(event: events.NewMessage.Event, client: TelegramClient) -> None:
-    """
-    Wywoływany przy każdej nowej wiadomości w SOURCE_GROUP_ID.
-    Pobiera media, zapisuje do SQLite i forwarduje do RAW_CHANNEL_ID.
-    """
-    msg: Message = event.message
-
-    # --- 1. Sprawdź czy źródło się zgadza ---
-    source_id = settings.source_group_id
-    if source_id != 0 and event.chat_id != source_id:
-        return  # Ignoruj wiadomości z innych czatów
-
+async def _process_message(msg: Message, chat_id: int, client: TelegramClient) -> None:
+    """Wspólny rdzeń: zapis do DB, media, AI, notyfikacja."""
     logger.info(
-        f"📨 Nowa wiadomość | id={msg.id} | chat={event.chat_id} | "
+        f"📨 Nowa wiadomość | id={msg.id} | chat={chat_id} | "
         f"media={'📷' if msg.media else '❌'} | "
         f"tekst={repr(msg.text[:60]) if msg.text else '(brak tekstu)'}"
     )
 
-    # --- 2. Zapisz do SQLite (na początku bez mediów) ---
     saved = save_raw_message(
         message_id=msg.id,
-        chat_id=event.chat_id,
+        chat_id=chat_id,
         timestamp=msg.date if isinstance(msg.date, datetime) else datetime.utcnow(),
         raw_text=msg.text or None,
         has_media=bool(msg.media),
         media_paths=[],
         grouped_id=msg.grouped_id,
     )
-
     if not saved:
         logger.warning(f"Duplikat wiadomości {msg.id} — pomijam")
         return
 
-    # --- 3. Pobierz media (jeśli są) ---
     media_paths = await download_media(msg, client)
     if media_paths:
-        update_media_paths(msg.id, event.chat_id, media_paths)
+        update_media_paths(msg.id, chat_id, media_paths)
         logger.success(f"💾 Zapisano {len(media_paths)} plik(ów) dla msg {msg.id}")
 
-    # --- 4. Analiza AI (jeśli klucz ustawiony) ---
-    if settings.gemini_api_key:
-        try:
-            ai_result = await analyze_message(
-                text=msg.text or None,
-                media_paths=media_paths if media_paths else None,
+    if not settings.gemini_api_key:
+        return
+    try:
+        ai_result = await analyze_message(
+            text=msg.text or None,
+            media_paths=media_paths if media_paths else None,
+        )
+        source_topic = _damian_topic_map.pop(msg.id, None)
+        if source_topic:
+            ai_result["source_topic"] = source_topic
+            logger.info(f"🏷  Źródło: {source_topic}")
+
+        save_ai_analysis(msg.id, chat_id, ai_result)
+
+        if ai_result.get("message_type") == "PORTFOLIO_UPDATE":
+            positions = ai_result.get("portfolio_positions")
+            if positions and isinstance(positions, list) and len(positions) > 0:
+                save_trader_positions(msg.id, positions)
+
+        logger.info(
+            f"🤖 AI: {ai_result.get('message_type', '?')} | "
+            f"confidence={ai_result.get('confidence', 0):.2f} | "
+            f"{ai_result.get('summary', '?')}"
+        )
+
+        msg_type   = ai_result.get("message_type")
+        confidence = ai_result.get("confidence", 0.0)
+        if msg_type in ("TRADE_ACTION", "PORTFOLIO_UPDATE", "INFORMATIONAL") and confidence >= 0.6:
+            await send_signal_notification(msg.id, ai_result, media_paths, client)
+        else:
+            logger.debug(
+                f"ℹ️ Bez powiadomienia: type={msg_type}, "
+                f"confidence={confidence:.2f} (próg 0.6)"
             )
-            # Dołącz źródło (IKE/IKZE) jeśli wiadomość pochodzi z grupy Damiana
-            source_topic = _damian_topic_map.pop(msg.id, None)
-            if source_topic:
-                ai_result["source_topic"] = source_topic
-                logger.info(f"🏷  Źródło: {source_topic}")
 
-            save_ai_analysis(msg.id, event.chat_id, ai_result)
+    except Exception as e:
+        logger.error(f"❌ Błąd AI analizy: {e}")
 
-            # Zapisz strukturalne pozycje portfela tradera
-            if ai_result.get("message_type") == "PORTFOLIO_UPDATE":
-                positions = ai_result.get("portfolio_positions")
-                if positions and isinstance(positions, list) and len(positions) > 0:
-                    save_trader_positions(msg.id, positions)
 
-            logger.info(
-                f"🤖 AI: {ai_result.get('message_type', '?')} | "
-                f"confidence={ai_result.get('confidence', 0):.2f} | "
-                f"{ai_result.get('summary', '?')}"
-            )
+async def handle_new_message(event: events.NewMessage.Event, client: TelegramClient) -> None:
+    """Wywoływany przez Telethon events.NewMessage dla SOURCE_GROUP_ID."""
+    msg: Message = event.message
 
-            # --- 6. Wyślij powiadomienie docelowe (sygnał lub portfel) ---
-            msg_type   = ai_result.get("message_type")
-            confidence = ai_result.get("confidence", 0.0)
-            if msg_type in ("TRADE_ACTION", "PORTFOLIO_UPDATE", "INFORMATIONAL") and confidence >= 0.6:
-                await send_signal_notification(msg.id, ai_result, media_paths, client)
-            else:
-                logger.debug(
-                    f"ℹ️ Bez powiadomienia: type={msg_type}, "
-                    f"confidence={confidence:.2f} (próg 0.6)"
-                )
+    source_id = settings.source_group_id
+    if source_id != 0 and event.chat_id != source_id:
+        return
 
-        except Exception as e:
-            logger.error(f"❌ Błąd AI analizy: {e}")
+    await _process_message(msg, event.chat_id, client)
 
 
 # ============================================================
@@ -209,6 +204,7 @@ async def handle_new_message(event: events.NewMessage.Event, client: TelegramCli
 
 HEARTBEAT_FILE = LOGS_DIR.parent / ".heartbeat"
 FETCH_REQUEST_FILE = Path("/tmp/.fetch_request.json")
+STAGING_MSG_FILE = Path("/tmp/.staging_msg.json")
 
 _last_message_at: str = "brak"
 _start_time = None
@@ -291,6 +287,46 @@ async def fetch_request_loop(client: TelegramClient, process_fn) -> None:
         except Exception as e:
             logger.error(f"fetch_request_loop error: {e}")
             FETCH_REQUEST_FILE.unlink(missing_ok=True)
+
+
+async def staging_msg_loop(client: TelegramClient) -> None:
+    """
+    Co 3 sekundy sprawdza /tmp/.staging_msg.json zostawiony przez monitor_bot.
+    Fallback dla Telethon events (zawodnych na broadcast channel).
+    """
+    import json
+    import time as _time
+
+    while True:
+        await asyncio.sleep(3)
+        if not STAGING_MSG_FILE.exists():
+            continue
+        try:
+            req = json.loads(STAGING_MSG_FILE.read_text())
+            STAGING_MSG_FILE.unlink(missing_ok=True)
+
+            msg_id = req.get("msg_id")
+            chat_id = req.get("chat_id") or settings.source_group_id
+            req_ts  = req.get("ts", 0)
+
+            if _time.time() - req_ts > 120:
+                logger.warning("staging_msg IPC zbyt stary (>120s) — pomijam")
+                continue
+            if not msg_id:
+                continue
+
+            msgs = await client.get_messages(chat_id, ids=[msg_id])
+            msg = msgs[0] if msgs else None
+            if not msg:
+                logger.warning(f"staging_msg: nie znaleziono msg_id={msg_id}")
+                continue
+
+            logger.info(f"📬 staging_msg_loop: przetwarzam msg_id={msg_id} z {chat_id}")
+            await _process_message(msg, chat_id, client)
+
+        except Exception as e:
+            logger.error(f"staging_msg_loop error: {e}")
+            STAGING_MSG_FILE.unlink(missing_ok=True)
 
 
 async def heartbeat_loop() -> None:
@@ -391,6 +427,7 @@ async def main() -> None:
 
         # Uruchom pętle w tle
         asyncio.create_task(heartbeat_loop())
+        asyncio.create_task(staging_msg_loop(client))
         if settings.damian_group_id:
             asyncio.create_task(fetch_request_loop(client, _forward_to_staging))
 

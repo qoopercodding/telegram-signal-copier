@@ -214,6 +214,7 @@ async def build_advisor_message(cash_pln: float) -> str:
 _AUTH_CODE_FILE = Path("/tmp/.damian_auth_code")
 _AUTH_REQUEST_FILE = Path("/tmp/.damian_auth_request")
 FETCH_REQUEST_FILE = Path("/tmp/.fetch_request.json")
+STAGING_MSG_FILE = Path("/tmp/.staging_msg.json")
 
 
 async def cmd_advisor_channel(event: events.NewMessage.Event, client: TelegramClient) -> None:
@@ -769,6 +770,18 @@ async def main() -> None:
         async def _channel_msg(event):
             await cmd_advisor_channel(event, client)
         logger.info(f"📡 Nasłuchuję kanał {settings.raw_channel_id} (advisor)")
+
+    # Nasłuch wiadomości na kanale test-bot-inwestor (staging → IPC → signal-copier AI)
+    if settings.source_group_id:
+        @client.on(events.NewMessage(chats=settings.source_group_id))
+        async def _staging_msg(event):
+            msg = event.message
+            if msg.out:
+                return
+            req = {"msg_id": msg.id, "chat_id": settings.source_group_id, "ts": time.time()}
+            STAGING_MSG_FILE.write_text(json.dumps(req))
+            logger.info(f"📨 staging IPC: msg_id={msg.id} → signal-copier")
+        logger.info(f"📡 Nasłuchuję staging {settings.source_group_id} (test-bot-inwestor)")
 
     await client.start(bot_token=settings.bot_token)
     me = await client.get_me()
