@@ -452,7 +452,10 @@ async def main() -> None:
         async def _staging_handler(event: events.NewMessage.Event) -> None:
             global _last_message_at
             _last_message_at = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-            await handle_new_message(event, client)
+            try:
+                await handle_new_message(event, client)
+            except Exception as e:
+                logger.error(f"_staging_handler error: {e}")
 
     # Handler 2 — DamianInwestorx IKE/IKZE → forward do test-bot-inwestor
     if settings.damian_group_id:
@@ -511,10 +514,47 @@ async def main() -> None:
     async with client:
         me = await client.get_me()
         logger.info(f"✅ Zalogowano jako: {me.first_name} (@{me.username})")
+
+        # Warm up entity cache — required for broadcast channel update tracking
+        for cid in filter(None, [settings.source_group_id, settings.raw_channel_id, settings.damian_group_id]):
+            try:
+                await client.get_entity(cid)
+                logger.info(f"✅ Entity cached: {cid}")
+            except Exception as e:
+                logger.warning(f"⚠️ Entity {cid}: {e}")
+
         logger.info("👂 Nasłuchuję...")
 
         write_heartbeat()
         asyncio.create_task(heartbeat_loop())
+
+        if settings.source_group_id:
+            # Polling fallback — events.NewMessage may miss updates on broadcast channels
+            async def _staging_poll_loop():
+                last_id = 0
+                try:
+                    seed = await client.get_messages(settings.source_group_id, limit=1)
+                    if seed:
+                        last_id = seed[0].id
+                        logger.info(f"🔄 Poll init: last_id={last_id}")
+                except Exception as e:
+                    logger.warning(f"Poll init error: {e}")
+
+                while True:
+                    await asyncio.sleep(15)
+                    try:
+                        new_msgs = await client.get_messages(
+                            settings.source_group_id, min_id=last_id, limit=20
+                        )
+                        for msg in reversed(new_msgs):
+                            if msg.id > last_id:
+                                last_id = msg.id
+                                logger.info(f"🔄 Poll: nowa wiadomość id={msg.id} na staging")
+                                await _process_message(msg, settings.source_group_id, client)
+                    except Exception as e:
+                        logger.error(f"Staging poll error: {e}")
+
+            asyncio.create_task(_staging_poll_loop())
 
         if settings.damian_group_id:
             # Fallback /fetch przez IPC (monitor_bot nadal może pisać plik)
