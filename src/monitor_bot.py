@@ -234,6 +234,12 @@ async def cmd_advisor_channel(event: events.NewMessage.Event, client: TelegramCl
         return
 
     text = (event.message.text or event.message.caption or "").strip()
+
+    # Zdjęcie od Marcina → AI analiza (przed sprawdzeniem tekstu — caption może być puste)
+    if event.message.photo or event.message.document:
+        await _handle_user_media(event, client, text or None)
+        return
+
     if not text:
         return
 
@@ -259,11 +265,6 @@ async def cmd_advisor_channel(event: events.NewMessage.Event, client: TelegramCl
     if re.match(r"^\d{5,6}$", stripped) and _AUTH_REQUEST_FILE.exists():
         _AUTH_CODE_FILE.write_text(stripped)
         logger.info(f"🔑 Kod SMS '{stripped}' przekazany do damian_watcher")
-        return
-
-    # Zdjęcie od Marcina → AI analiza
-    if event.message.photo or event.message.document:
-        await _handle_user_media(event, client, text or None)
         return
 
     # /advisor lub kwota PLN
