@@ -1,135 +1,131 @@
 """
-Telethon Listener — Iteracja 3: Read, Download, Forward & AI Parse.
+signal-copier userbot — wszystkie kanały w jednym procesie Telethon.
 
-Co robi:
-  1. Loguje się do Telegrama jako Ty (userbot)
-  2. Nasłuchuje nowych wiadomości w SOURCE_GROUP_ID
-  3. Pobiera media (zdjęcia, dokumenty) i zapisuje lokalnie
-  4. Zapisuje każdą wiadomość do SQLite (z ścieżkami do mediów)
-  5. Forwarduje wiadomość do RAW_CHANNEL_ID
-  6. Analizuje wiadomość przez Google Gemini (AI parser)
+Flow:
+  DamianInwestorx (IKE/IKZE topics) → forward → test-bot-inwestor
+  test-bot-inwestor           → AI Gemini → recive-bot-investor (wyniki)
+  recive-bot-investor (Marcin) → AI Q&A, /fetch, zdjęcia → odpowiedź na kanale
 
 Uruchomienie:
     python -m src.listener
-
-Pierwsze uruchomienie: zapyta o numer telefonu + kod SMS → tworzy plik .session
 """
 
 import asyncio
+import re
+import time as _time_mod
 from datetime import datetime
 from pathlib import Path
 
 from loguru import logger
 from telethon import TelegramClient, events
-from telethon.tl.types import (
-    Message,
-    MessageMediaPhoto,
-    MessageMediaDocument,
-)
+from telethon.tl.types import Message, MessageMediaPhoto, MessageMediaDocument
 
 from src.config import settings, ensure_directories, LOGS_DIR, MEDIA_DIR
-from src.storage import init_db, save_raw_message, update_media_paths, save_ai_analysis, count_messages, save_trader_positions
+from src.storage import (
+    init_db, save_raw_message, update_media_paths,
+    save_ai_analysis, count_messages, save_trader_positions,
+    get_latest_trader_positions,
+)
 from src.parser import analyze_message
 from src.notifier import send_signal_notification
+from src.prices import get_share_price
 
 
 # ============================================================
-# Konfiguracja logowania
+# Logging + klient
 # ============================================================
 
 def setup_logging() -> None:
-    """Konfiguruje loguru — logi do konsoli i do pliku."""
     log_file = LOGS_DIR / "listener_{time:YYYY-MM-DD}.log"
-    logger.add(
-        str(log_file),
-        rotation="1 day",
-        retention="7 days",
-        level="DEBUG",
-        encoding="utf-8",
-    )
+    logger.add(str(log_file), rotation="1 day", retention="7 days", level="DEBUG", encoding="utf-8")
 
-
-# ============================================================
-# Klient Telethon
-# ============================================================
 
 def build_client() -> TelegramClient:
-    """Tworzy klienta Telethon z konfiguracją z .env"""
     session_path = str(LOGS_DIR.parent / settings.session_name)
-    return TelegramClient(
-        session_path,
-        settings.telegram_api_id,
-        settings.telegram_api_hash,
-    )
+    return TelegramClient(session_path, settings.telegram_api_id, settings.telegram_api_hash)
 
 
 # ============================================================
-# Pobieranie mediów
+# Media download
 # ============================================================
 
 async def download_media(msg: Message, client: TelegramClient) -> list[str]:
-    """
-    Pobiera media z wiadomości i zapisuje do media/.
-    Zwraca listę ścieżek do pobranych plików.
-    """
     if not msg.media:
         return []
-
     media_paths: list[str] = []
-
-    # Generuj nazwę pliku: YYYYMMDD_HHMMSS_msgID
     ts = msg.date.strftime("%Y%m%d_%H%M%S") if msg.date else "unknown"
     base_name = f"{ts}_{msg.id}"
-
     try:
         if isinstance(msg.media, MessageMediaPhoto):
-            # --- Zdjęcie ---
             file_path = MEDIA_DIR / f"{base_name}.jpg"
             await client.download_media(msg, file=str(file_path))
             media_paths.append(str(file_path))
             logger.info(f"📷 Pobrano zdjęcie → {file_path.name}")
-
         elif isinstance(msg.media, MessageMediaDocument):
-            # --- Dokument (PDF, screenshot PNG, itp.) ---
             doc = msg.media.document
-            # Odczytaj oryginalną nazwę pliku jeśli jest
             ext = ".bin"
             if doc and doc.mime_type:
-                mime_to_ext = {
-                    "image/png": ".png",
-                    "image/jpeg": ".jpg",
-                    "image/webp": ".webp",
-                    "application/pdf": ".pdf",
-                    "video/mp4": ".mp4",
-                }
-                ext = mime_to_ext.get(doc.mime_type, ".bin")
-
+                ext = {"image/png": ".png", "image/jpeg": ".jpg", "image/webp": ".webp",
+                       "application/pdf": ".pdf", "video/mp4": ".mp4"}.get(doc.mime_type, ".bin")
             file_path = MEDIA_DIR / f"{base_name}{ext}"
             await client.download_media(msg, file=str(file_path))
             media_paths.append(str(file_path))
-            logger.info(f"📎 Pobrano dokument → {file_path.name} ({doc.mime_type})")
-
-        else:
-            logger.debug(f"⏭️ Pominięto media typu: {type(msg.media).__name__}")
-
+            logger.info(f"📎 Pobrano dokument → {file_path.name}")
     except Exception as e:
         logger.error(f"❌ Błąd pobierania mediów z msg {msg.id}: {e}")
-
     return media_paths
 
 
 # ============================================================
-# Handler nowych wiadomości
+# Heartbeat
+# ============================================================
+
+HEARTBEAT_FILE = LOGS_DIR.parent / ".heartbeat"
+FETCH_REQUEST_FILE = Path("/tmp/.fetch_request.json")
+
+_last_message_at: str = "brak"
+_start_time: float | None = None
+_damian_topic_map: dict[int, str] = {}   # forwarded_msg_id → "IKE" / "IKZE"
+
+
+def write_heartbeat() -> None:
+    import json
+    from datetime import timedelta
+    global _start_time
+    if _start_time is None:
+        _start_time = _time_mod.time()
+    uptime_delta = timedelta(seconds=int(_time_mod.time() - _start_time))
+    d = uptime_delta.days
+    h, rem = divmod(uptime_delta.seconds, 3600)
+    m, _ = divmod(rem, 60)
+    HEARTBEAT_FILE.write_text(json.dumps({
+        "timestamp": datetime.utcnow().isoformat(),
+        "uptime": f"{d}d {h}h {m}m",
+        "last_message_at": _last_message_at,
+        "messages_total": count_messages(),
+    }))
+
+
+async def heartbeat_loop() -> None:
+    while True:
+        try:
+            write_heartbeat()
+        except Exception as e:
+            logger.error(f"Heartbeat error: {e}")
+        await asyncio.sleep(300)
+
+
+# ============================================================
+# Pipeline AI: test-bot-inwestor → Gemini → recive-bot-investor
 # ============================================================
 
 async def _process_message(msg: Message, chat_id: int, client: TelegramClient) -> None:
-    """Wspólny rdzeń: zapis do DB, media, AI, notyfikacja."""
+    """Zapis do DB + media + AI + notyfikacja. Rdzeń całego pipeline."""
     logger.info(
         f"📨 Nowa wiadomość | id={msg.id} | chat={chat_id} | "
         f"media={'📷' if msg.media else '❌'} | "
-        f"tekst={repr(msg.text[:60]) if msg.text else '(brak tekstu)'}"
+        f"tekst={repr((msg.text or '')[:60])}"
     )
-
     saved = save_raw_message(
         message_id=msg.id,
         chat_id=chat_id,
@@ -140,21 +136,18 @@ async def _process_message(msg: Message, chat_id: int, client: TelegramClient) -
         grouped_id=msg.grouped_id,
     )
     if not saved:
-        logger.warning(f"Duplikat wiadomości {msg.id} — pomijam")
+        logger.warning(f"Duplikat msg {msg.id} — pomijam")
         return
 
     media_paths = await download_media(msg, client)
     if media_paths:
         update_media_paths(msg.id, chat_id, media_paths)
-        logger.success(f"💾 Zapisano {len(media_paths)} plik(ów) dla msg {msg.id}")
 
     if not settings.gemini_api_key:
         return
     try:
-        ai_result = await analyze_message(
-            text=msg.text or None,
-            media_paths=media_paths if media_paths else None,
-        )
+        ai_result = await analyze_message(text=msg.text or None, media_paths=media_paths or None)
+
         source_topic = _damian_topic_map.pop(msg.id, None)
         if source_topic:
             ai_result["source_topic"] = source_topic
@@ -164,180 +157,273 @@ async def _process_message(msg: Message, chat_id: int, client: TelegramClient) -
 
         if ai_result.get("message_type") == "PORTFOLIO_UPDATE":
             positions = ai_result.get("portfolio_positions")
-            if positions and isinstance(positions, list) and len(positions) > 0:
+            if positions and isinstance(positions, list):
                 save_trader_positions(msg.id, positions)
-
-        logger.info(
-            f"🤖 AI: {ai_result.get('message_type', '?')} | "
-            f"confidence={ai_result.get('confidence', 0):.2f} | "
-            f"{ai_result.get('summary', '?')}"
-        )
 
         msg_type   = ai_result.get("message_type")
         confidence = ai_result.get("confidence", 0.0)
+        logger.info(f"🤖 AI: {msg_type} | confidence={confidence:.2f} | {ai_result.get('summary','?')[:80]}")
+
         if msg_type in ("TRADE_ACTION", "PORTFOLIO_UPDATE", "INFORMATIONAL") and confidence >= 0.6:
             await send_signal_notification(msg.id, ai_result, media_paths, client)
         else:
-            logger.debug(
-                f"ℹ️ Bez powiadomienia: type={msg_type}, "
-                f"confidence={confidence:.2f} (próg 0.6)"
-            )
+            logger.debug(f"ℹ️ Bez powiadomienia: type={msg_type}, confidence={confidence:.2f}")
 
     except Exception as e:
-        logger.error(f"❌ Błąd AI analizy: {e}")
+        logger.error(f"❌ Błąd AI analizy msg {msg.id}: {e}")
 
 
 async def handle_new_message(event: events.NewMessage.Event, client: TelegramClient) -> None:
-    """Wywoływany przez Telethon events.NewMessage dla SOURCE_GROUP_ID."""
+    """Handler dla SOURCE_GROUP_ID (test-bot-inwestor)."""
     msg: Message = event.message
-
     source_id = settings.source_group_id
     if source_id != 0 and event.chat_id != source_id:
         return
-
     await _process_message(msg, event.chat_id, client)
 
 
 # ============================================================
-# Heartbeat (monitor bot sprawdza ten plik)
+# Advisor — kalkulator pozycji (odpowiedź na recive-bot-investor)
 # ============================================================
 
-HEARTBEAT_FILE = LOGS_DIR.parent / ".heartbeat"
-FETCH_REQUEST_FILE = Path("/tmp/.fetch_request.json")
-STAGING_MSG_FILE = Path("/tmp/.staging_msg.json")
-
-_last_message_at: str = "brak"
-_start_time = None
-_damian_topic_map: dict[int, str] = {}  # forwarded_msg_id → "IKE" / "IKZE"
+_CASH_RE = re.compile(r'(\d[\d\s]*(?:[.,]\d+)?)\s*(k|tys\.?)?\s*pln', re.IGNORECASE)
 
 
-def write_heartbeat() -> None:
-    """Zapisuje heartbeat do pliku JSON."""
-    import json
-    from datetime import timedelta
-    import time
-
-    global _start_time
-    if _start_time is None:
-        _start_time = time.time()
-
-    uptime_delta = timedelta(seconds=int(time.time() - _start_time))
-    days = uptime_delta.days
-    hours, remainder = divmod(uptime_delta.seconds, 3600)
-    minutes, _ = divmod(remainder, 60)
-
-    data = {
-        "timestamp": datetime.utcnow().isoformat(),
-        "uptime": f"{days}d {hours}h {minutes}m",
-        "last_message_at": _last_message_at,
-        "messages_total": count_messages(),
-    }
-    HEARTBEAT_FILE.write_text(json.dumps(data))
+def parse_cash_amount(text: str) -> float | None:
+    m = _CASH_RE.search(text)
+    if not m:
+        return None
+    amount_str = m.group(1).replace(" ", "").replace(",", ".")
+    suffix = (m.group(2) or "").lower()
+    try:
+        amount = float(amount_str)
+        if suffix.startswith("k") or suffix.startswith("tys"):
+            amount *= 1000
+        return amount
+    except ValueError:
+        return None
 
 
-async def fetch_request_loop(client: TelegramClient, process_fn) -> None:
-    """
-    Co 5 sekund sprawdza plik /tmp/.fetch_request.json zostawiony przez monitor_bot.
-    Gdy znajdzie — pobiera wiadomości z Damiana i wywołuje process_fn dla każdej.
-    """
-    import json
-    import time as _time
-    from src.damian_watcher import TOPIC_NAMES
+async def build_advisor_message(cash_pln: float) -> str:
+    positions = get_latest_trader_positions()
+    if not positions:
+        return (
+            "⚠️ *Brak danych o portfelu tradera w bazie.*\n\n"
+            "Poczekaj aż Damian wyśle screenshot portfela — bot go przetworzy.\n"
+            "Potem napisz ponownie ile masz PLN."
+        )
 
-    while True:
-        await asyncio.sleep(5)
-        if not FETCH_REQUEST_FILE.exists():
-            continue
+    source_date = (positions[0].get("created_at") or "")[:10]
+    price_results: list[tuple[float | None, str]] = await asyncio.gather(
+        *[asyncio.to_thread(get_share_price, p["ticker"]) for p in positions],
+        return_exceptions=False,
+    )
+
+    has_pct = any((pos.get("percentage") or 0) > 0 for pos in positions)
+    n = len(positions)
+    equal_pct = 100.0 / n if n > 0 else 0.0
+
+    lines = [
+        f"📊 *Propozycja alokacji {cash_pln:,.0f} PLN*",
+        f"_Na podstawie portfela tradera z {source_date}_",
+    ]
+    if not has_pct:
+        lines.append(f"_⚠️ Brak % w DB — równy podział na {n} spółek ({equal_pct:.1f}% każda)_")
+    lines.append("")
+
+    total = 0.0
+    any_shares = False
+    for pos, (price, _src) in zip(positions, price_results):
+        ticker = pos["ticker"]
+        pct    = (pos.get("percentage") or 0.0) if has_pct else equal_pct
+        target = cash_pln * pct / 100
+        if price and price > 0:
+            shares = int(target / price)
+            actual = shares * price
+            total += actual
+            if shares > 0:
+                any_shares = True
+                lines.append(f"• *{ticker}* {pct:.1f}% → *{shares} szt.* @ {price:.2f} PLN = *{actual:,.0f} PLN*")
+            else:
+                lines.append(f"• *{ticker}* {pct:.1f}% → za mało _(masz {target:.0f} PLN, min. {price:.2f} PLN/szt.)_")
+        else:
+            total += target
+            lines.append(f"• *{ticker}* {pct:.1f}% → *{target:,.0f} PLN* _(kurs niedostępny)_")
+
+    if not any_shares:
+        lines += ["", "⚠️ *Za mało PLN na jakikolwiek zakup przy tej alokacji.*"]
+        return "\n".join(lines)
+
+    reszta = cash_pln - total
+    lines += ["", f"💸 Zainwestowane: *{total:,.0f} PLN*"]
+    if reszta > 0.5:
+        lines.append(f"💵 Zostaje: *{reszta:,.0f} PLN*")
+    return "\n".join(lines)
+
+
+async def _answer_question(text: str, client: TelegramClient) -> str:
+    """Odpowiada na pytanie Marcina przez Gemini z kontekstem portfela i logów."""
+    from src.parser import get_client as get_ai_client
+    from google.genai import types as gtypes
+
+    AI_MODEL = "gemini-2.5-flash"
+
+    positions = get_latest_trader_positions()
+    if positions:
+        pos_lines = [
+            f"  {p['ticker']}: {(p.get('percentage') or 0):.1f}%"
+            + (f", {p['value_pln']:,.0f} PLN" if p.get("value_pln") else "")
+            for p in positions
+        ]
+        portfolio_ctx = "Ostatnie pozycje portfela tradera w DB:\n" + "\n".join(pos_lines)
+    else:
+        portfolio_ctx = "Brak danych o portfelu tradera w bazie SQLite."
+
+    log_ctx = ""
+    log_files = sorted(LOGS_DIR.glob("listener_*.log"), reverse=True)
+    if log_files:
         try:
-            req = json.loads(FETCH_REQUEST_FILE.read_text())
-            FETCH_REQUEST_FILE.unlink(missing_ok=True)
+            lines = log_files[0].read_text(encoding="utf-8").strip().split("\n")
+            log_ctx = "Ostatnie logi signal-copier:\n" + "\n".join(lines[-15:])
+        except Exception:
+            pass
 
-            topic_id = req.get("topic_id")
-            count = int(req.get("count", 5))
-            req_ts = req.get("ts", 0)
+    prompt = (
+        f"Jesteś asystentem Marcina — właściciela systemu do śledzenia sygnałów GPW.\n\n"
+        f"KIM JESTEŚ: Model {AI_MODEL} (Google Gemini). NIE jesteś brokerem ani doradcą. "
+        f"Masz dostęp do danych z bazy SQLite i logów. Odpowiadaj krótko po polsku (max 4 zdania).\n\n"
+        f"{portfolio_ctx}\n\n{log_ctx}\n\n"
+        f"PYTANIE: {text}"
+    )
 
-            if _time.time() - req_ts > 120:
-                logger.warning("fetch_request zbyt stary (>120s) — pomijam")
-                continue
-            if not topic_id:
-                continue
-
-            topic_name = TOPIC_NAMES.get(topic_id, str(topic_id))
-            logger.info(f"📋 fetch_request_loop: {topic_name} x{count}")
-
-            msgs = []
-            async for m in client.iter_messages(
-                entity=settings.damian_group_id,
-                reply_to=topic_id,
-                limit=count,
-            ):
-                msgs.append(m)
-
-            if not msgs:
-                logger.warning(f"Brak wiadomości w [{topic_name}]")
-                continue
-
-            msgs.reverse()
-            for m in msgs:
-                await process_fn(m, topic_name)
-                await asyncio.sleep(0.3)
-
-            logger.info(f"✅ fetch_request_loop: {topic_name} — przetworzono {len(msgs)} wiadomości")
-
-        except Exception as e:
-            logger.error(f"fetch_request_loop error: {e}")
-            FETCH_REQUEST_FILE.unlink(missing_ok=True)
+    ai_client = get_ai_client()
+    response = await asyncio.wait_for(
+        ai_client.aio.models.generate_content(
+            model=AI_MODEL,
+            contents=[gtypes.Part.from_text(text=prompt)],
+        ),
+        timeout=60,
+    )
+    return (response.text or "").strip()
 
 
-async def staging_msg_loop(client: TelegramClient) -> None:
+async def handle_channel_message(
+    event: events.NewMessage.Event,
+    client: TelegramClient,
+    forward_fn,
+) -> None:
     """
-    Co 3 sekundy sprawdza /tmp/.staging_msg.json zostawiony przez monitor_bot.
-    Fallback dla Telethon events (zawodnych na broadcast channel).
+    Handler dla wiadomości od Marcina na recive-bot-investor.
+    Obsługuje: /fetch, kwoty PLN (advisor), pytania AI, zdjęcia.
     """
-    import json
-    import time as _time
+    msg: Message = event.message
+    if msg.out:
+        return
 
-    while True:
-        await asyncio.sleep(3)
-        if not STAGING_MSG_FILE.exists():
-            continue
+    text = (msg.text or "").strip()
+
+    # Zdjęcie → AI analiza
+    if msg.media and isinstance(msg.media, (MessageMediaPhoto, MessageMediaDocument)):
+        tmp_path = MEDIA_DIR / f"user_input_{msg.id}.jpg"
         try:
-            req = json.loads(STAGING_MSG_FILE.read_text())
-            STAGING_MSG_FILE.unlink(missing_ok=True)
-
-            msg_id = req.get("msg_id")
-            chat_id = req.get("chat_id") or settings.source_group_id
-            req_ts  = req.get("ts", 0)
-
-            if _time.time() - req_ts > 120:
-                logger.warning("staging_msg IPC zbyt stary (>120s) — pomijam")
-                continue
-            if not msg_id:
-                continue
-
-            msgs = await client.get_messages(chat_id, ids=[msg_id])
-            msg = msgs[0] if msgs else None
-            if not msg:
-                logger.warning(f"staging_msg: nie znaleziono msg_id={msg_id}")
-                continue
-
-            logger.info(f"📬 staging_msg_loop: przetwarzam msg_id={msg_id} z {chat_id}")
-            await _process_message(msg, chat_id, client)
-
+            await asyncio.wait_for(client.download_media(msg, file=str(tmp_path)), timeout=30)
         except Exception as e:
-            logger.error(f"staging_msg_loop error: {e}")
-            STAGING_MSG_FILE.unlink(missing_ok=True)
+            logger.error(f"Błąd pobierania zdjęcia od Marcina: {e}")
+            await client.send_message(settings.raw_channel_id, "❌ Nie mogłem pobrać zdjęcia")
+            return
 
-
-async def heartbeat_loop() -> None:
-    """Co 5 minut zapisuje heartbeat."""
-    while True:
+        logger.info(f"📷 Zdjęcie od Marcina: {tmp_path.name}")
+        await client.send_message(settings.raw_channel_id, "🤔 Analizuję...")
         try:
-            write_heartbeat()
-            logger.debug("💓 Heartbeat zapisany")
+            ai = await asyncio.wait_for(
+                analyze_message(text=text or None, media_paths=[str(tmp_path)]),
+                timeout=90,
+            )
+            msg_type   = ai.get("message_type")
+            confidence = ai.get("confidence", 0.0)
+            summary    = ai.get("summary", "")
+            lines = [f"🔍 *Analiza zdjęcia* (pewność: {confidence*100:.0f}%)", "", f"_{summary}_", ""]
+
+            if msg_type == "PORTFOLIO_UPDATE":
+                positions = ai.get("portfolio_positions") or []
+                if positions:
+                    lines.append("📊 *Wykryte pozycje:*")
+                    for p in positions:
+                        lines.append(f"• {p['ticker']} — {(p.get('percentage') or 0):.1f}%")
+                    lines += ["", "💡 _Napisz ile masz PLN, a obliczę ile sztuk kupić._"]
+            elif msg_type == "TRADE_ACTION":
+                ts = ai.get("trade_signal") or {}
+                lines.append(f"📈 Widzę akcję: *{ts.get('action','?')} {ts.get('ticker','?')}*")
+            else:
+                trader_pos = get_latest_trader_positions()
+                if trader_pos:
+                    tickers = ", ".join(p["ticker"] for p in trader_pos[:5])
+                    lines.append(f"ℹ️ Komentarz rynkowy. Portfel tradera: {tickers}...")
+                else:
+                    lines.append("ℹ️ Komentarz rynkowy — brak sygnału tradingowego.")
+
+            await client.send_message(settings.raw_channel_id, "\n".join(lines), parse_mode="markdown")
+        except asyncio.TimeoutError:
+            await client.send_message(settings.raw_channel_id, "❌ Timeout analizy AI (>90s)")
         except Exception as e:
-            logger.error(f"Heartbeat error: {e}")
-        await asyncio.sleep(300)  # 5 minut
+            logger.error(f"Błąd analizy zdjęcia: {e}")
+            await client.send_message(settings.raw_channel_id, f"❌ Błąd analizy: {e}")
+        finally:
+            tmp_path.unlink(missing_ok=True)
+        return
+
+    if not text:
+        return
+
+    # /fetch IKE N lub /fetch IKZE N
+    if text.lower().startswith("/fetch"):
+        from src.damian_watcher import parse_fetch_command, TOPIC_NAMES
+        topic_id, count = parse_fetch_command(text)
+        if not topic_id:
+            await client.send_message(settings.raw_channel_id,
+                "Użycie: `/fetch IKE 5` lub `/fetch IKZE 10`", parse_mode="markdown")
+            return
+        topic_name = TOPIC_NAMES.get(topic_id, str(topic_id))
+        await client.send_message(settings.raw_channel_id,
+            f"⏳ Pobieram *{count}* wiadomości z *{topic_name}*...", parse_mode="markdown")
+        msgs_fetched = []
+        async for m in client.iter_messages(entity=settings.damian_group_id, reply_to=topic_id, limit=count):
+            msgs_fetched.append(m)
+        if not msgs_fetched:
+            await client.send_message(settings.raw_channel_id, f"⚠️ Brak wiadomości w {topic_name}")
+            return
+        msgs_fetched.reverse()
+        for m in msgs_fetched:
+            await forward_fn(m, topic_name)
+            await asyncio.sleep(0.3)
+        logger.info(f"✅ /fetch {topic_name} x{len(msgs_fetched)}")
+        return
+
+    # Kwota PLN → advisor
+    cash = parse_cash_amount(text)
+    if cash:
+        logger.info(f"💡 Advisor: {cash:,.0f} PLN")
+        try:
+            reply = await asyncio.wait_for(build_advisor_message(cash), timeout=30)
+            await client.send_message(settings.raw_channel_id, reply, parse_mode="markdown")
+        except asyncio.TimeoutError:
+            await client.send_message(settings.raw_channel_id, "❌ Timeout pobierania kursów")
+        except Exception as e:
+            logger.error(f"Advisor błąd: {e}")
+            await client.send_message(settings.raw_channel_id, f"❌ Błąd kalkulatora: {e}")
+        return
+
+    # Pytanie tekstowe → AI
+    if len(text) >= 10 and not text.startswith("/"):
+        logger.info(f"💬 Pytanie Marcina: {text[:60]}")
+        try:
+            answer = await _answer_question(text, client)
+            if answer:
+                await client.send_message(settings.raw_channel_id, f"💬 {answer}", parse_mode="markdown")
+        except asyncio.TimeoutError:
+            await client.send_message(settings.raw_channel_id, "❌ Timeout AI (>60s)")
+        except Exception as e:
+            logger.error(f"Błąd odpowiedzi AI: {e}")
 
 
 # ============================================================
@@ -346,39 +432,33 @@ async def heartbeat_loop() -> None:
 
 async def main() -> None:
     global _last_message_at, _start_time
-    import time
-    _start_time = time.time()
+    _start_time = _time_mod.time()
 
     ensure_directories()
     setup_logging()
     init_db()
 
-    logger.info("🚀 Telegram Signal Copier — Iteracja 2")
-    logger.info(f"   Źródło:    {settings.source_group_id or '(wszystkie czaty — ustaw SOURCE_GROUP_ID)'}")
-    logger.info(f"   Cel:       {settings.raw_channel_id or '(brak — ustaw RAW_CHANNEL_ID)'}")
-    logger.info(f"   Media:     {MEDIA_DIR}")
-    logger.info(f"   Baza:      {settings.db_path}")
+    logger.info("🚀 Signal Copier — userbot all-in-one")
+    logger.info(f"   Staging:   {settings.source_group_id}  (test-bot-inwestor)")
+    logger.info(f"   Output:    {settings.raw_channel_id}   (recive-bot-investor)")
+    logger.info(f"   Damian:    {settings.damian_group_id}")
     logger.info(f"   Wiadomości w bazie: {count_messages()}")
 
     client = build_client()
 
-    # Handler 1 — wiadomości z test-bot-inwestor (główny pipeline AI)
-    source_filter = events.NewMessage(chats=settings.source_group_id if settings.source_group_id else None)
+    # Handler 1 — test-bot-inwestor → AI → recive-bot-investor
+    if settings.source_group_id:
+        @client.on(events.NewMessage(chats=settings.source_group_id))
+        async def _staging_handler(event: events.NewMessage.Event) -> None:
+            global _last_message_at
+            _last_message_at = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+            await handle_new_message(event, client)
 
-    @client.on(source_filter)
-    async def _handler(event: events.NewMessage.Event) -> None:
-        global _last_message_at
-        _last_message_at = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-        await handle_new_message(event, client)
-
-    # Handler 2 — wiadomości z prywatnej grupy Damiana (IKE/IKZE → forward do test-bot-inwestor)
+    # Handler 2 — DamianInwestorx IKE/IKZE → forward do test-bot-inwestor
     if settings.damian_group_id:
-        from src.damian_watcher import (
-            is_watched_topic, get_topic_id, TOPIC_NAMES,
-        )
+        from src.damian_watcher import is_watched_topic, get_topic_id, TOPIC_NAMES
 
         async def _forward_to_staging(msg: Message, topic_name: str) -> None:
-            """Forwarduje wiadomość Damiana do SOURCE_GROUP_ID (test-bot-inwestor)."""
             saved = save_raw_message(
                 message_id=msg.id,
                 chat_id=settings.damian_group_id,
@@ -389,9 +469,8 @@ async def main() -> None:
                 grouped_id=msg.grouped_id,
             )
             if not saved:
-                logger.debug(f"[{topic_name}] Duplikat msg {msg.id} — pomijam forward")
+                logger.debug(f"[{topic_name}] Duplikat msg {msg.id} — pomijam")
                 return
-
             try:
                 fwd = await client.forward_messages(
                     entity=settings.source_group_id,
@@ -400,7 +479,7 @@ async def main() -> None:
                 )
                 fwd_id = fwd[0].id if isinstance(fwd, list) else fwd.id
                 _damian_topic_map[fwd_id] = topic_name
-                logger.info(f"📤 [{topic_name}] Forwarded Damian msg {msg.id} → staging {fwd_id}")
+                logger.info(f"📤 [{topic_name}] msg {msg.id} → staging {fwd_id}")
             except Exception as e:
                 logger.error(f"❌ Forward [{topic_name}] msg {msg.id}: {e}")
 
@@ -410,26 +489,66 @@ async def main() -> None:
             if not is_watched_topic(msg):
                 return
             topic_name = TOPIC_NAMES.get(get_topic_id(msg), "?")
-            logger.info(f"📩 Damian [{topic_name}] nowa wiadomość id={msg.id}")
+            logger.info(f"📩 Damian [{topic_name}] id={msg.id}")
             await _forward_to_staging(msg, topic_name)
 
-        logger.info(f"   Damian:    {settings.damian_group_id} (IKE:{settings.damian_ike_topic_id} IKZE:{settings.damian_ikze_topic_id})")
-        logger.info(f"   Staging:   {settings.source_group_id} (test-bot-inwestor)")
-        logger.info(f"   /fetch:    polling {FETCH_REQUEST_FILE} co 5s")
+    # Handler 3 — recive-bot-investor → odpowiadamy na pytania Marcina
+    if settings.raw_channel_id:
+        @client.on(events.NewMessage(chats=settings.raw_channel_id))
+        async def _channel_handler(event: events.NewMessage.Event) -> None:
+            global _last_message_at
+            _last_message_at = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+            try:
+                await asyncio.wait_for(
+                    handle_channel_message(event, client, _forward_to_staging),
+                    timeout=120,
+                )
+            except asyncio.TimeoutError:
+                logger.error("handle_channel_message timeout 120s")
+            except Exception as e:
+                logger.error(f"handle_channel_message error: {e}")
 
     async with client:
         me = await client.get_me()
         logger.info(f"✅ Zalogowano jako: {me.first_name} (@{me.username})")
-        logger.info("👂 Nasłuchuję... (Ctrl+C żeby zatrzymać)")
+        logger.info("👂 Nasłuchuję...")
 
-        # Pierwszy heartbeat
         write_heartbeat()
-
-        # Uruchom pętle w tle
         asyncio.create_task(heartbeat_loop())
-        asyncio.create_task(staging_msg_loop(client))
+
         if settings.damian_group_id:
-            asyncio.create_task(fetch_request_loop(client, _forward_to_staging))
+            # Fallback /fetch przez IPC (monitor_bot nadal może pisać plik)
+            async def _fetch_loop():
+                import json
+                while True:
+                    await asyncio.sleep(5)
+                    if not FETCH_REQUEST_FILE.exists():
+                        continue
+                    try:
+                        req = json.loads(FETCH_REQUEST_FILE.read_text())
+                        FETCH_REQUEST_FILE.unlink(missing_ok=True)
+                        topic_id = req.get("topic_id")
+                        count_req = int(req.get("count", 5))
+                        req_ts = req.get("ts", 0)
+                        if _time_mod.time() - req_ts > 120 or not topic_id:
+                            continue
+                        from src.damian_watcher import TOPIC_NAMES
+                        topic_name = TOPIC_NAMES.get(topic_id, str(topic_id))
+                        logger.info(f"📋 IPC /fetch: {topic_name} x{count_req}")
+                        fetched = []
+                        async for m in client.iter_messages(
+                            entity=settings.damian_group_id, reply_to=topic_id, limit=count_req
+                        ):
+                            fetched.append(m)
+                        fetched.reverse()
+                        for m in fetched:
+                            await _forward_to_staging(m, topic_name)
+                            await asyncio.sleep(0.3)
+                    except Exception as e:
+                        logger.error(f"fetch_loop error: {e}")
+                        FETCH_REQUEST_FILE.unlink(missing_ok=True)
+
+            asyncio.create_task(_fetch_loop())
 
         await client.run_until_disconnected()
 
