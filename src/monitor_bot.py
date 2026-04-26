@@ -150,19 +150,26 @@ async def build_advisor_message(cash_pln: float) -> str:
         return_exceptions=False,
     )
 
+    # Sprawdź czy mamy dane procentowe
+    has_pct = any((pos.get("percentage") or 0) > 0 for pos in positions)
+    n = len(positions)
+    equal_pct = 100.0 / n if n > 0 else 0.0
+
     lines = [
         f"📊 *Propozycja alokacji {cash_pln:,.0f} PLN*",
         f"_Na podstawie portfela tradera z {source_date}_",
-        "",
     ]
+    if not has_pct:
+        lines.append(f"_⚠️ Brak % w DB — równy podział na {n} spółek ({equal_pct:.1f}% każda)_")
+    lines.append("")
 
     total_zainwestowane = 0.0
     any_shares = False
 
     for pos, (price, symbol) in zip(positions, price_results):
-        ticker  = pos["ticker"]
-        pct     = pos.get("percentage") or 0.0
-        target  = cash_pln * pct / 100
+        ticker = pos["ticker"]
+        pct    = (pos.get("percentage") or 0.0) if has_pct else equal_pct
+        target = cash_pln * pct / 100
 
         if price and price > 0:
             shares = int(target / price)
@@ -176,8 +183,8 @@ async def build_advisor_message(cash_pln: float) -> str:
                 )
             else:
                 lines.append(
-                    f"• *{ticker}* {pct:.1f}% → za mało _(min. {price:.2f} PLN na 1 szt., "
-                    f"masz {target:.0f} PLN)_"
+                    f"• *{ticker}* {pct:.1f}% → za mało _(masz {target:.0f} PLN, "
+                    f"min. {price:.2f} PLN/szt.)_"
                 )
         else:
             total_zainwestowane += target
@@ -186,18 +193,11 @@ async def build_advisor_message(cash_pln: float) -> str:
             )
 
     if not any_shares:
-        lines = [
-            f"⚠️ *Kwota {cash_pln:,.0f} PLN to za mało na jakikolwiek zakup.*",
-            f"_Portfel tradera z {source_date}_",
+        lines += [
             "",
+            f"⚠️ *Za mało PLN na jakikolwiek zakup przy tej alokacji.*",
+            f"Napisz ponownie z większą kwotą, np. `mam 120k PLN`",
         ]
-        for pos, (price, _) in zip(positions, price_results):
-            ticker = pos["ticker"]
-            pct    = pos.get("percentage") or 0.0
-            if price:
-                needed = price / (pct / 100) if pct else 0
-                lines.append(f"• *{ticker}* — 1 szt. kosztuje *{price:.2f} PLN* (potrzebujesz min. *{needed:,.0f} PLN* na tę pozycję)")
-        lines += ["", f"Napisz ponownie z większą kwotą, np. `mam 120k PLN`"]
         return "\n".join(lines)
 
     reszta = cash_pln - total_zainwestowane
@@ -290,6 +290,9 @@ async def cmd_advisor_channel(event: events.NewMessage.Event, client: TelegramCl
         except Exception as exc:
             logger.error(f"Advisor błąd: {exc}")
             await event.respond(f"❌ Błąd kalkulatora: {exc}")
+        # Gdy tekst zawiera pytanie OBOK kwoty — odpowiedz też na nie
+        if len(text) >= 20 and ("?" in text or "jaki" in text.lower() or "ile" in text.lower() or "co" in text.lower()):
+            await _handle_user_question(event, text)
         return
 
     # Pytanie tekstowe (min. 10 znaków, nie komenda)
@@ -371,7 +374,9 @@ async def _handle_user_question(event: events.NewMessage.Event, text: str) -> No
 
     positions = get_latest_trader_positions()
     if positions:
-        pos_str = ", ".join(f"{p['ticker']} {p.get('percentage',0):.0f}%" for p in positions)
+        pos_str = ", ".join(
+            f"{p['ticker']} {(p.get('percentage') or 0):.0f}%" for p in positions
+        )
         context = f"Portfel tradera: {pos_str}"
     else:
         context = "Brak danych o portfelu tradera w bazie."
