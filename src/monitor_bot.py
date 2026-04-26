@@ -233,7 +233,7 @@ async def cmd_advisor_channel(event: events.NewMessage.Event, client: TelegramCl
     if sender and getattr(sender, "bot", False):
         return
 
-    text = (event.message.text or event.message.caption or "").strip()
+    text = (event.message.message or "").strip()
 
     # Zdjęcie od Marcina → AI analiza (przed sprawdzeniem tekstu — caption może być puste)
     if event.message.photo or event.message.document:
