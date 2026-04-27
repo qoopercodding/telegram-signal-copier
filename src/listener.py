@@ -525,21 +525,8 @@ async def main() -> None:
             logger.info(f"📩 Damian [{topic_name}] id={msg.id}")
             await _forward_to_staging(msg, topic_name)
 
-    # Handler 3 — recive-bot-investor → odpowiadamy na pytania Marcina
-    if settings.raw_channel_id:
-        @client.on(events.NewMessage(chats=settings.raw_channel_id))
-        async def _channel_handler(event: events.NewMessage.Event) -> None:
-            global _last_message_at
-            _last_message_at = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-            try:
-                await asyncio.wait_for(
-                    handle_channel_message(event.message, client, _forward_to_staging),
-                    timeout=120,
-                )
-            except asyncio.TimeoutError:
-                logger.error("handle_channel_message timeout 120s")
-            except Exception as e:
-                logger.error(f"handle_channel_message error: {e}")
+    # Handler 3 — usunięty: _output_poll_loop co 15s obsługuje recive-bot-investor
+    # events.NewMessage + poll loop = podwójne odpowiedzi dla tego samego msg
 
     async with client:
         me = await client.get_me()
