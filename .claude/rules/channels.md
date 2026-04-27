@@ -23,13 +23,13 @@ IKE i IKZE trafiają razem do recive-bot-investor (-1003925454327).
 **Ważne przy testach:** nie używaj signal_copier.session z testu gdy serwis działa.
 Zamiast tego: `shutil.copy2(session, "/tmp/test_pipeline_session.session")`.
 
-## .env (aktualne wartości)
+## .env — klucze (NIE wpisuj tu wartości — secrets tylko w pliku .env na VM)
 
 ```
-TELEGRAM_API_ID=36661880
-TELEGRAM_API_HASH=f849584c847a5a892abd2f683838c76a
-BOT_TOKEN=8729025942:AAEIXPsdq7iQLV-RI5TbxOz0zdug3YKJgKc
-GEMINI_API_KEY=AIzaSyDz_Oj4rzA_ls4RSh0G64UAEjH-VyWhMqU
+TELEGRAM_API_ID=...
+TELEGRAM_API_HASH=...
+BOT_TOKEN=...          # @signal_copier_monitor_bot
+GEMINI_API_KEY=...     # Google AI Studio → wymień jeśli skompromitowany
 DECISION_CHAT_ID=1463931213
 DAMIAN_GROUP_ID=-1001548727545
 SOURCE_GROUP_ID=-1003728819658
@@ -39,15 +39,14 @@ SIGNAL_TTL_MINUTES=15
 ```
 
 **Brakujące klucze (AI fallbacki):** ANTHROPIC_API_KEY, OPENAI_API_KEY — nie ustawione.
-Używany jest tylko Gemini (GEMINI_API_KEY jest).
+Używany jest tylko Gemini.
 
 ## VM
 
 - Ścieżka projektu: `/home/marcin/telegram-signal-copier`
 - Venv: `venv/bin/activate`
 - Serwisy systemd: `signal-copier`, `signal-monitor`
-- Hasło sudo: 12345678
-- GitHub push: `git push origin main` (token w URL remote, ważny ~90 dni od 2026-04-24)
+- GitHub push: `git push origin main` (token w URL remote)
 
 ## Boty Telegram
 
