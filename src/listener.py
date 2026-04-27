@@ -263,11 +263,8 @@ async def build_advisor_message(cash_pln: float) -> str:
 
 
 async def _answer_question(text: str, client: TelegramClient) -> str:
-    """Odpowiada na pytanie Marcina przez Gemini z kontekstem portfela i logów."""
-    from src.parser import get_client as get_ai_client
-    from google.genai import types as gtypes
-
-    AI_MODEL = "gemini-2.5-flash"
+    """Odpowiada na pytanie Marcina przez call_ai (Claude Haiku) z kontekstem portfela i logów."""
+    from src.ai_providers import call_ai
 
     positions = get_latest_trader_positions()
     if positions:
@@ -291,21 +288,14 @@ async def _answer_question(text: str, client: TelegramClient) -> str:
 
     prompt = (
         f"Jesteś asystentem Marcina — właściciela systemu do śledzenia sygnałów GPW.\n\n"
-        f"KIM JESTEŚ: Model {AI_MODEL} (Google Gemini). NIE jesteś brokerem ani doradcą. "
+        f"NIE jesteś brokerem ani doradcą. "
         f"Masz dostęp do danych z bazy SQLite i logów. Odpowiadaj krótko po polsku (max 4 zdania).\n\n"
         f"{portfolio_ctx}\n\n{log_ctx}\n\n"
         f"PYTANIE: {text}"
     )
 
-    ai_client = get_ai_client()
-    response = await asyncio.wait_for(
-        ai_client.aio.models.generate_content(
-            model=AI_MODEL,
-            contents=[gtypes.Part.from_text(text=prompt)],
-        ),
-        timeout=60,
-    )
-    return (response.text or "").strip()
+    answer, _model = await asyncio.wait_for(call_ai(prompt=prompt), timeout=60)
+    return answer
 
 
 async def _send_to_raw(client: TelegramClient, text: str, **kwargs) -> None:

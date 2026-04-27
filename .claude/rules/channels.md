@@ -6,13 +6,10 @@
 |---|---|---|---|---|
 | test-bot-inwestor (staging) | -1003728819658 | https://t.me/+3Tn1wpYFUlAwOTE0 | SOURCE_GROUP_ID | broadcast |
 | recive-bot-investor (output AI) | -1003925454327 | https://t.me/+q0z9RRgeEnMyNzk0 | RAW_CHANNEL_ID | broadcast |
-| recive-bot-investor IKZE | -1003887841086 | https://t.me/+8huGz4cCbb9iZTk0 | (brak w .env) | supergroup |
 | DamianInwestorx | -1001548727545 | prywatna | DAMIAN_GROUP_ID | supergroup |
 | DamianInwestorx — temat IKE | topic 8951 | https://t.me/c/1548727545/8951 | DAMIAN_IKE_TOPIC_ID | — |
 | DamianInwestorx — temat IKZE | topic 8953 | https://t.me/c/1548727545/8953 | DAMIAN_IKZE_TOPIC_ID | — |
 
-**UWAGA:** recive-bot-investor IKZE (-1003887841086) nie jest w .env.
-IKE i IKZE trafiają razem do recive-bot-investor (-1003925454327).
 
 ## Sesje Telethon
 
