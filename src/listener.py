@@ -492,7 +492,39 @@ async def main() -> None:
                 _damian_topic_map[fwd_id] = topic_name
                 logger.info(f"📤 [{topic_name}] msg {msg.id} → staging {fwd_id}")
             except Exception as e:
-                logger.error(f"❌ Forward [{topic_name}] msg {msg.id}: {e}")
+                if "protected" in str(e).lower() or "ChatForwardsRestrictedError" in type(e).__name__:
+                    # Grupa Damiana ma "Restrict saving content" — pobieramy i re-wysyłamy
+                    logger.info(f"🔒 Protected chat — re-wysyłam [{topic_name}] msg {msg.id}")
+                    await _resend_to_staging(msg, topic_name)
+                else:
+                    logger.error(f"❌ Forward [{topic_name}] msg {msg.id}: {e}")
+
+        async def _resend_to_staging(msg: Message, topic_name: str) -> None:
+            """Fallback gdy forward zablokowany przez protected chat — pobieramy + re-wysyłamy."""
+            text = msg.text or ""
+            caption = f"[{topic_name}] {text}" if text else f"[{topic_name}]"
+            tmp_path = None
+            try:
+                if msg.media:
+                    tmp_path = MEDIA_DIR / f"damian_resend_{msg.id}.jpg"
+                    await asyncio.wait_for(
+                        client.download_media(msg, file=str(tmp_path)), timeout=30
+                    )
+                    sent = await client.send_file(
+                        settings.source_group_id,
+                        str(tmp_path),
+                        caption=caption,
+                    )
+                else:
+                    sent = await client.send_message(settings.source_group_id, caption)
+                fwd_id = sent.id
+                _damian_topic_map[fwd_id] = topic_name
+                logger.info(f"📤 [{topic_name}] msg {msg.id} → staging {fwd_id} (re-send)")
+            except Exception as e:
+                logger.error(f"❌ Re-send [{topic_name}] msg {msg.id}: {e}")
+            finally:
+                if tmp_path:
+                    tmp_path.unlink(missing_ok=True)
 
         @client.on(events.NewMessage(chats=settings.damian_group_id))
         async def _damian_handler(event: events.NewMessage.Event) -> None:
