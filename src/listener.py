@@ -144,8 +144,6 @@ async def _process_message(msg: Message, chat_id: int, client: TelegramClient) -
     if media_paths:
         update_media_paths(msg.id, chat_id, media_paths)
 
-    if not settings.gemini_api_key:
-        return
     try:
         ai_result = await analyze_message(text=msg.text or None, media_paths=media_paths or None)
 
